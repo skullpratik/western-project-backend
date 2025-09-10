@@ -7,9 +7,25 @@ const jwt = require("jsonwebtoken");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
+const ActivityLog = require("./models/ActivityLog");
 require("dotenv").config();
 
 const app = express();
+
+// Helper to safely extract client IP (supports proxies if X-Forwarded-For present)
+function getClientIp(req) {
+  try {
+    const xf = req.headers['x-forwarded-for'];
+    if (xf) {
+      // X-Forwarded-For may contain multiple IPs: client, proxy1, proxy2
+      const parts = xf.split(',').map(p => p.trim()).filter(Boolean);
+      if (parts.length) return parts[0];
+    }
+    return req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || '0.0.0.0';
+  } catch (e) {
+    return '0.0.0.0';
+  }
+}
 
 // Middleware - Updated with your IP
 app.use(cors({
@@ -33,6 +49,9 @@ app.use(cors({
 
 app.use(express.json());
 
+// Serve uploaded models statically from backend
+app.use('/models', express.static(path.join(__dirname, '../Frontend/public/models')));
+
 // Connect to MongoDB
 const MONGODB_URI = process.env.MONGO_URI || "mongodb://localhost:27017/3dconfigurator";
 
@@ -53,6 +72,7 @@ const UserSchema = new mongoose.Schema({
     textureWidget: { type: Boolean, default: false },
     lightWidget: { type: Boolean, default: false },
     globalTextureWidget: { type: Boolean, default: false },
+    saveConfig: { type: Boolean, default: false },
     canRotate: { type: Boolean, default: true },
     canPan: { type: Boolean, default: false },
     canZoom: { type: Boolean, default: false }
@@ -69,12 +89,7 @@ const ModelSchema = new mongoose.Schema({
   file: { type: String, required: true },
   type: { type: String, required: true },
   status: { type: String, enum: ['active', 'inactive'], default: 'active' },
-  interactionGroups: [{ 
-    name: String,
-    parts: [String],
-    type: String,
-    config: mongoose.Schema.Types.Mixed
-  }],
+  interactionGroups: mongoose.Schema.Types.Mixed,
   metadata: mongoose.Schema.Types.Mixed,
   uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 }, { timestamps: true });
@@ -165,6 +180,7 @@ const ensureDefaultAccounts = async () => {
       textureWidget: true,
       lightWidget: true,
       globalTextureWidget: true,
+      saveConfig: true,
       canRotate: true,
       canPan: true,
       canZoom: true
@@ -371,7 +387,28 @@ app.get("/api/admin-dashboard/users", authMiddleware, async (req, res) => {
     }
 
     const users = await User.find({}, { password: 0 }).sort({ createdAt: -1 });
-    res.json(users);
+    
+    // Ensure all users have complete permissions structure
+    const defaultPermissions = {
+      doorPresets: false,
+      doorToggles: false,
+      drawerToggles: false,
+      textureWidget: false,
+      lightWidget: false,
+      globalTextureWidget: false,
+      saveConfig: false,
+      canRotate: true,
+      canPan: false,
+      canZoom: false
+    };
+
+    const usersWithCompletePermissions = users.map(user => {
+      const userObj = user.toObject();
+      userObj.permissions = { ...defaultPermissions, ...userObj.permissions };
+      return userObj;
+    });
+
+    res.json(usersWithCompletePermissions);
   } catch (error) {
     console.error("Get users error:", error);
     res.status(500).json({ message: "Error fetching users", error: error.message });
@@ -385,9 +422,26 @@ app.put("/api/admin-dashboard/users/:id/permissions", authMiddleware, async (req
     }
 
     const { permissions } = req.body;
+    
+    // Ensure complete permissions structure
+    const defaultPermissions = {
+      doorPresets: false,
+      doorToggles: false,
+      drawerToggles: false,
+      textureWidget: false,
+      lightWidget: false,
+      globalTextureWidget: false,
+      saveConfig: false,
+      canRotate: true,
+      canPan: false,
+      canZoom: false
+    };
+
+    const completePermissions = { ...defaultPermissions, ...permissions };
+
     const user = await User.findByIdAndUpdate(
       req.params.id,
-      { permissions },
+      { permissions: completePermissions },
       { new: true, select: "-password" }
     );
     
@@ -597,7 +651,40 @@ app.get("/api/activity/stats", authMiddleware, async (req, res) => {
   }
 });
 
-// Model Management Routes (Admin only)
+// Model Management Routes
+
+// Get active models for users (no auth required for viewing models)
+app.get("/api/models", async (req, res) => {
+  try {
+    const models = await Model.find({ status: 'active' }).select('-uploadedBy -createdAt -updatedAt');
+    
+    // Convert to format expected by frontend
+    const formattedModels = models.map(model => ({
+      id: model._id,
+      name: model.name,
+      displayName: model.displayName,
+      file: `http://localhost:5000/models/${model.file}`,
+      type: model.type,
+      interactionGroups: model.interactionGroups || [],
+      metadata: model.metadata || {}
+    }));
+    
+    console.log('=== MODELS API DEBUG ===');
+    console.log('Raw models from DB:', models.length);
+    if (models.length > 0) {
+      console.log('Sample model metadata:', models[0].metadata);
+    }
+    console.log('Formatted models:', formattedModels);
+    console.log('=======================');
+    
+    res.json(formattedModels);
+  } catch (error) {
+    console.error("Get models error:", error);
+    res.status(500).json({ message: "Error fetching models", error: error.message });
+  }
+});
+
+// Admin only routes
 const requireAdmin = (req, res, next) => {
   if (!req.user || req.user.role !== 'admin') {
     return res.status(403).json({ message: 'Admin access required' });
@@ -629,6 +716,11 @@ app.post("/api/admin/models/upload", authMiddleware, requireAdmin, upload.single
     const parsedInteractionGroups = interactionGroups ? JSON.parse(interactionGroups) : [];
     const parsedMetadata = metadata ? JSON.parse(metadata) : {};
 
+    console.log('=== UPLOAD DEBUG ===');
+    console.log('Parsed Interaction Groups:', parsedInteractionGroups);
+    console.log('Parsed Metadata:', parsedMetadata);
+    console.log('====================');
+
     const newModel = new Model({
       name,
       displayName,
@@ -656,6 +748,88 @@ app.post("/api/admin/models/upload", authMiddleware, requireAdmin, upload.single
       }
     }
     res.status(500).json({ message: "Error uploading model", error: error.message });
+  }
+});
+
+// Simple file upload endpoint (just uploads file, no model creation)
+app.post("/api/upload", authMiddleware, requireAdmin, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "No file uploaded" });
+    }
+
+    // Return the file path
+    const filePath = `http://localhost:5000/models/${req.file.filename}`;
+    res.status(200).json({
+      message: "File uploaded successfully",
+      path: filePath,
+      filename: req.file.filename
+    });
+  } catch (error) {
+    console.error("File upload error:", error);
+    // Clean up uploaded file on error
+    if (req.file) {
+      const fileToDelete = path.join(__dirname, '../Frontend/public/models', req.file.filename);
+      if (fs.existsSync(fileToDelete)) {
+        fs.unlinkSync(fileToDelete);
+      }
+    }
+    res.status(500).json({ message: "Error uploading file", error: error.message });
+  }
+});
+
+// Save model configuration (when file is already uploaded)
+app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const { name, path, ...config } = req.body;
+    
+    if (!name) {
+      return res.status(400).json({ message: "Model name is required" });
+    }
+    
+    if (!path) {
+      return res.status(400).json({ message: "Model path is required" });
+    }
+
+    console.log('=== SAVE MODEL CONFIG DEBUG ===');
+    console.log('Name:', name);
+    console.log('Path:', path);
+    console.log('Config:', config);
+    console.log('===============================');
+
+    // Extract filename from path for storage
+    const filename = path.split('/').pop();
+
+    const newModel = new Model({
+      name,
+      displayName: name,
+      file: filename,
+      type: 'glb',
+      interactionGroups: config.interactionGroups || [],
+      metadata: {
+        camera: config.camera,
+        hiddenInitially: config.hiddenInitially || [],
+        lights: config.lights || [],
+        uiWidgets: config.uiWidgets || []
+      },
+      uploadedBy: req.user._id
+    });
+
+    await newModel.save();
+    await newModel.populate('uploadedBy', 'name email');
+
+    console.log('=== MODEL SAVED ===');
+    console.log('Model ID:', newModel._id);
+    console.log('Model metadata:', newModel.metadata);
+    console.log('==================');
+
+    res.status(201).json({
+      message: "Model saved successfully",
+      model: newModel
+    });
+  } catch (error) {
+    console.error("Save model error:", error);
+    res.status(500).json({ message: "Error saving model", error: error.message });
   }
 });
 
@@ -696,7 +870,11 @@ app.put("/api/admin/models/:id", authMiddleware, requireAdmin, async (req, res) 
 app.delete("/api/admin/models/:id", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
+    console.log('=== DELETE MODEL DEBUG ===');
+    console.log('Model ID to delete:', id);
+    
     const model = await Model.findById(id);
+    console.log('Found model:', model ? `${model.name} (${model.file})` : 'null');
 
     if (!model) {
       return res.status(404).json({ message: "Model not found" });
@@ -704,11 +882,19 @@ app.delete("/api/admin/models/:id", authMiddleware, requireAdmin, async (req, re
 
     // Delete the file
     const filePath = path.join(__dirname, '../Frontend/public/models', model.file);
+    console.log('File path to delete:', filePath);
+    console.log('File exists:', fs.existsSync(filePath));
+    
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
+      console.log('File deleted successfully');
+    } else {
+      console.log('File does not exist, skipping file deletion');
     }
 
     await Model.findByIdAndDelete(id);
+    console.log('Model deleted from database');
+    console.log('========================');
 
     res.json({ message: "Model deleted successfully" });
   } catch (error) {
