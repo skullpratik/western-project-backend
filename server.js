@@ -91,6 +91,13 @@ const ModelSchema = new mongoose.Schema({
   status: { type: String, enum: ['active', 'inactive'], default: 'active' },
   interactionGroups: mongoose.Schema.Types.Mixed,
   metadata: mongoose.Schema.Types.Mixed,
+  // Add explicit fields for configuration data
+  camera: mongoose.Schema.Types.Mixed,
+  lights: mongoose.Schema.Types.Mixed,
+  hiddenInitially: mongoose.Schema.Types.Mixed,
+  uiWidgets: mongoose.Schema.Types.Mixed,
+  assets: mongoose.Schema.Types.Mixed,
+  presets: mongoose.Schema.Types.Mixed,
   uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 }, { timestamps: true });
 
@@ -123,6 +130,37 @@ const upload = multer({
       cb(null, true);
     } else {
       cb(new Error('Only GLB and GLTF files are allowed'), false);
+    }
+  }
+});
+
+// Configure multer for texture uploads
+const textureStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadPath = path.join(__dirname, '../Frontend/public/texture');
+    // Create directory if it doesn't exist
+    if (!fs.existsSync(uploadPath)) {
+      fs.mkdirSync(uploadPath, { recursive: true });
+    }
+    cb(null, uploadPath);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, 'texture-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const uploadTexture = multer({ 
+  storage: textureStorage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit for textures
+  fileFilter: function (req, file, cb) {
+    // Accept only image files
+    const allowedTypes = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'];
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (allowedTypes.includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files (JPG, PNG, BMP, TIFF, WebP) are allowed'), false);
     }
   }
 });
@@ -778,6 +816,34 @@ app.post("/api/upload", authMiddleware, requireAdmin, upload.single('file'), asy
   }
 });
 
+// Upload texture file
+app.post("/api/admin/textures/upload", authMiddleware, requireAdmin, uploadTexture.single('textureFile'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "No file uploaded" });
+    }
+
+    // Return the file path relative to public directory
+    const filePath = `/texture/${req.file.filename}`;
+    res.status(200).json({
+      message: "Texture uploaded successfully",
+      path: filePath,
+      filename: req.file.filename,
+      originalName: req.file.originalname
+    });
+  } catch (error) {
+    console.error("Texture upload error:", error);
+    // Clean up uploaded file on error
+    if (req.file) {
+      const fileToDelete = path.join(__dirname, '../Frontend/public/texture', req.file.filename);
+      if (fs.existsSync(fileToDelete)) {
+        fs.unlinkSync(fileToDelete);
+      }
+    }
+    res.status(500).json({ message: "Error uploading texture", error: error.message });
+  }
+});
+
 // Save model configuration (when file is already uploaded)
 app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => {
   try {
@@ -837,18 +903,41 @@ app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => 
 app.put("/api/admin/models/:id", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, displayName, type, status, interactionGroups, metadata } = req.body;
+    const { 
+      name, 
+      displayName, 
+      type, 
+      status, 
+      interactionGroups, 
+      metadata,
+      camera,
+      lights,
+      hiddenInitially,
+      uiWidgets,
+      assets,
+      presets
+    } = req.body;
+
+    const updateData = {
+      name,
+      displayName,
+      type,
+      status,
+      interactionGroups,
+      metadata
+    };
+
+    // Add optional fields if they exist
+    if (camera) updateData.camera = camera;
+    if (lights) updateData.lights = lights;
+    if (hiddenInitially) updateData.hiddenInitially = hiddenInitially;
+    if (uiWidgets) updateData.uiWidgets = uiWidgets;
+    if (assets) updateData.assets = assets;
+    if (presets) updateData.presets = presets;
 
     const model = await Model.findByIdAndUpdate(
       id,
-      {
-        name,
-        displayName,
-        type,
-        status,
-        interactionGroups,
-        metadata
-      },
+      updateData,
       { new: true }
     ).populate('uploadedBy', 'name email');
 
