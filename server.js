@@ -47,7 +47,8 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' })); // Increase JSON payload limit for configurations
+app.use(express.urlencoded({ limit: '50mb', extended: true })); // Also increase URL-encoded limit
 
 // Serve uploaded models statically from backend
 app.use('/models', express.static(path.join(__dirname, '../Frontend/public/models')));
@@ -75,7 +76,8 @@ const UserSchema = new mongoose.Schema({
     saveConfig: { type: Boolean, default: false },
     canRotate: { type: Boolean, default: true },
     canPan: { type: Boolean, default: false },
-    canZoom: { type: Boolean, default: false }
+    canZoom: { type: Boolean, default: false },
+    canMove: { type: Boolean, default: false }
   },
   isActive: { type: Boolean, default: true }
 }, { timestamps: true });
@@ -98,10 +100,46 @@ const ModelSchema = new mongoose.Schema({
   uiWidgets: mongoose.Schema.Types.Mixed,
   assets: mongoose.Schema.Types.Mixed,
   presets: mongoose.Schema.Types.Mixed,
+  // Model positioning fields
+  modelPosition: { type: [Number], default: [0, 0, 0] },
+  modelRotation: { type: [Number], default: [0, 0, 0] },
+  modelScale: { type: Number, default: 2 },
+  // Simplified placement mode (autofit = autoFitModel, focused = keep model origin and only set camera)
+  placementMode: { type: String, enum: ['autofit', 'focused'], default: 'autofit' },
   uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 }, { timestamps: true });
 
 const Model = mongoose.model("Model", ModelSchema);
+
+// SavedConfiguration Schema for user configurations
+const SavedConfigurationSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  description: { type: String, default: '' },
+  modelName: { type: String, required: true },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  configData: {
+    // Model state data
+    doorConfiguration: mongoose.Schema.Types.Mixed,  // Which doors are open/closed
+    textureSettings: mongoose.Schema.Types.Mixed,    // Applied textures (with file paths)
+    cameraPosition: mongoose.Schema.Types.Mixed,     // Camera state
+    widgetStates: mongoose.Schema.Types.Mixed,       // Widget configurations
+    visibilityStates: mongoose.Schema.Types.Mixed,   // What's visible/hidden
+    customizations: mongoose.Schema.Types.Mixed      // Any other custom settings
+  },
+  textureFiles: [{                                   // Array of texture files for this config
+    originalName: String,                            // Original filename from user
+    savedPath: String,                               // Path where file is stored
+    configKey: String,                               // Key in textureSettings this file corresponds to
+    fileSize: Number,                                // File size in bytes
+    mimeType: String,                                // MIME type of the file
+    uploadedAt: { type: Date, default: Date.now }   // When texture was uploaded
+  }],
+  isPublic: { type: Boolean, default: false },      // For sharing configs
+  tags: [String],                                    // For categorizing configs
+  previewImage: String                               // Optional screenshot
+}, { timestamps: true });
+
+const SavedConfiguration = mongoose.model("SavedConfiguration", SavedConfigurationSchema);
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -165,6 +203,58 @@ const uploadTexture = multer({
   }
 });
 
+// Utility function to copy texture files for configuration storage
+async function copyTextureForConfig(sourcePath, configId, textureKey) {
+  try {
+    console.log(`📂 copyTextureForConfig called with:`, { sourcePath, configId, textureKey });
+    
+    const configTexturesPath = path.join(__dirname, '../Frontend/public/config-textures', configId);
+    console.log(`📂 Config textures path: ${configTexturesPath}`);
+    
+    // Create directory if it doesn't exist
+    if (!fs.existsSync(configTexturesPath)) {
+      fs.mkdirSync(configTexturesPath, { recursive: true });
+      console.log(`📂 Created directory: ${configTexturesPath}`);
+    }
+    
+    const sourceFullPath = path.join(__dirname, '../Frontend/public', sourcePath);
+    const filename = `${textureKey}-${path.basename(sourcePath)}`;
+    const destinationPath = path.join(configTexturesPath, filename);
+    
+    console.log(`📂 Source path: ${sourceFullPath}`);
+    console.log(`📂 Destination path: ${destinationPath}`);
+    
+    // Check if source file exists
+    if (!fs.existsSync(sourceFullPath)) {
+      throw new Error(`Source texture file not found: ${sourceFullPath}`);
+    }
+    
+    // Copy the file
+    await fs.promises.copyFile(sourceFullPath, destinationPath);
+    console.log(`✅ File copied successfully`);
+    
+    // Return the relative path for frontend access
+    const relativePath = `/config-textures/${configId}/${filename}`;
+    console.log(`📂 Returning relative path: ${relativePath}`);
+    return relativePath;
+  } catch (error) {
+    console.error('❌ Error copying texture file:', error);
+    throw error;
+  }
+}
+
+// Utility function to clean up texture files when configuration is deleted
+async function cleanupConfigTextures(configId) {
+  try {
+    const configTexturesPath = path.join(__dirname, '../Frontend/public/config-textures', configId);
+    if (fs.existsSync(configTexturesPath)) {
+      await fs.promises.rmdir(configTexturesPath, { recursive: true });
+    }
+  } catch (error) {
+    console.error('Error cleaning up texture files:', error);
+  }
+}
+
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key-here";
 
@@ -221,7 +311,8 @@ const ensureDefaultAccounts = async () => {
       saveConfig: true,
       canRotate: true,
       canPan: true,
-      canZoom: true
+      canZoom: true,
+      canMove: true
     };
 
     await ensureAccount({
@@ -704,15 +795,26 @@ app.get("/api/models", async (req, res) => {
       file: `http://localhost:5000/models/${model.file}`,
       type: model.type,
       interactionGroups: model.interactionGroups || [],
-      metadata: model.metadata || {}
+  metadata: model.metadata || {},
+  // Expose admin-defined placement/transform so the viewer can apply it
+  placementMode: model.placementMode || 'autofit',
+  modelPosition: Array.isArray(model.modelPosition) ? model.modelPosition : undefined,
+  modelRotation: Array.isArray(model.modelRotation) ? model.modelRotation : undefined,
+  modelScale: typeof model.modelScale === 'number' ? model.modelScale : undefined
     }));
     
     console.log('=== MODELS API DEBUG ===');
     console.log('Raw models from DB:', models.length);
     if (models.length > 0) {
       console.log('Sample model metadata:', models[0].metadata);
+      console.log('Sample placement fields:', {
+        placementMode: models[0].placementMode,
+        modelPosition: models[0].modelPosition,
+        modelRotation: models[0].modelRotation,
+        modelScale: models[0].modelScale
+      });
     }
-    console.log('Formatted models:', formattedModels);
+    console.log('Formatted models (with placement fields):', formattedModels);
     console.log('=======================');
     
     res.json(formattedModels);
@@ -844,6 +946,36 @@ app.post("/api/admin/textures/upload", authMiddleware, requireAdmin, uploadTextu
   }
 });
 
+// Upload texture file (for regular users)
+app.post("/api/upload-texture", authMiddleware, uploadTexture.single('texture'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "No file uploaded" });
+    }
+
+    // Return the file path relative to public directory
+    const filePath = `/texture/${req.file.filename}`;
+    console.log(`📤 Texture uploaded successfully: ${filePath}`);
+    
+    res.status(200).json({
+      message: "Texture uploaded successfully",
+      path: filePath,
+      filename: req.file.filename,
+      originalName: req.file.originalname
+    });
+  } catch (error) {
+    console.error("Texture upload error:", error);
+    // Clean up uploaded file on error
+    if (req.file) {
+      const fileToDelete = path.join(__dirname, '../Frontend/public/texture', req.file.filename);
+      if (fs.existsSync(fileToDelete)) {
+        fs.unlinkSync(fileToDelete);
+      }
+    }
+    res.status(500).json({ message: "Error uploading texture", error: error.message });
+  }
+});
+
 // Save model configuration (when file is already uploaded)
 app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => {
   try {
@@ -862,6 +994,12 @@ app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => 
     console.log('Path:', path);
     console.log('Config:', config);
     console.log('===============================');
+    console.log('Incoming placement/transform fields:', {
+      placementMode: config.placementMode,
+      modelPosition: config.modelPosition,
+      modelRotation: config.modelRotation,
+      modelScale: config.modelScale
+    });
 
     // Extract filename from path for storage
     const filename = path.split('/').pop();
@@ -873,15 +1011,26 @@ app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => 
       type: 'glb',
       interactionGroups: config.interactionGroups || [],
       metadata: {
-        camera: config.camera,
+        camera: config.camera, // may be null now
         hiddenInitially: config.hiddenInitially || [],
         lights: config.lights || [],
         uiWidgets: config.uiWidgets || []
       },
+      // Admin-defined transform (optional)
+      modelPosition: config.modelPosition,
+      modelRotation: config.modelRotation,
+      modelScale: config.modelScale,
+      placementMode: config.placementMode || 'autofit',
       uploadedBy: req.user._id
     });
 
     await newModel.save();
+    console.log('Persisted placement/transform fields:', {
+      placementMode: newModel.placementMode,
+      modelPosition: newModel.modelPosition,
+      modelRotation: newModel.modelRotation,
+      modelScale: newModel.modelScale
+    });
     await newModel.populate('uploadedBy', 'name email');
 
     console.log('=== MODEL SAVED ===');
@@ -915,7 +1064,11 @@ app.put("/api/admin/models/:id", authMiddleware, requireAdmin, async (req, res) 
       hiddenInitially,
       uiWidgets,
       assets,
-      presets
+      presets,
+      placementMode,
+      modelPosition,
+      modelRotation,
+      modelScale
     } = req.body;
 
     const updateData = {
@@ -934,6 +1087,19 @@ app.put("/api/admin/models/:id", authMiddleware, requireAdmin, async (req, res) 
     if (uiWidgets) updateData.uiWidgets = uiWidgets;
     if (assets) updateData.assets = assets;
     if (presets) updateData.presets = presets;
+  if (placementMode) updateData.placementMode = placementMode;
+  if (Array.isArray(modelPosition)) updateData.modelPosition = modelPosition;
+  if (Array.isArray(modelRotation)) updateData.modelRotation = modelRotation;
+  if (typeof modelScale === 'number') updateData.modelScale = modelScale;
+  if (presets) updateData.presets = presets;
+
+    console.log('=== UPDATE MODEL DEBUG ===');
+    console.log('Incoming placement/transform fields:', {
+      placementMode,
+      modelPosition,
+      modelRotation,
+      modelScale
+    });
 
     const model = await Model.findByIdAndUpdate(
       id,
@@ -944,6 +1110,13 @@ app.put("/api/admin/models/:id", authMiddleware, requireAdmin, async (req, res) 
     if (!model) {
       return res.status(404).json({ message: "Model not found" });
     }
+
+    console.log('Persisted placement/transform fields after update:', {
+      placementMode: model.placementMode,
+      modelPosition: model.modelPosition,
+      modelRotation: model.modelRotation,
+      modelScale: model.modelScale
+    });
 
     res.json({
       message: "Model updated successfully",
@@ -1018,6 +1191,169 @@ app.get("/api/admin/models/files", authMiddleware, requireAdmin, async (req, res
     res.status(500).json({ message: "Error fetching model files", error: error.message });
   }
 });
+
+// ==========================================
+// SAVED CONFIGURATIONS API ENDPOINTS
+// ==========================================
+
+// Save user configuration
+app.post("/api/configs/save", authMiddleware, async (req, res) => {
+  try {
+    const { name, description, modelName, configData, tags, isPublic } = req.body;
+    
+    if (!name || !modelName || !configData) {
+      return res.status(400).json({ message: "Name, modelName, and configData are required" });
+    }
+
+    // Create the configuration first to get an ID
+    const savedConfig = new SavedConfiguration({
+      name,
+      description: description || '',
+      modelName,
+      userId: req.user._id,
+      configData,
+      tags: tags || [],
+      isPublic: isPublic || false,
+      textureFiles: []
+    });
+
+    await savedConfig.save();
+    
+    // Process texture files if any textures are applied
+    if (configData.textureSettings && Object.keys(configData.textureSettings).length > 0) {
+      console.log('🔍 Processing texture files for configuration save:');
+      console.log('configData.textureSettings:', configData.textureSettings);
+      
+      const textureFiles = [];
+      
+      for (const [textureKey, textureInfo] of Object.entries(configData.textureSettings)) {
+        console.log(`🔍 Processing texture key: ${textureKey}`, textureInfo);
+        
+        // Check if we have a texture source that's a file path
+        const textureSource = textureInfo.textureSource;
+        console.log(`🔍 Texture source: ${textureSource}`);
+        
+        if (textureSource && (textureSource.startsWith('/texture/') || textureSource.startsWith('texture/'))) {
+          try {
+            console.log(`📂 Copying texture file: ${textureSource}`);
+            
+            // Copy the texture file to configuration storage
+            const savedPath = await copyTextureForConfig(
+              textureSource, 
+              savedConfig._id.toString(), 
+              textureKey
+            );
+            
+            console.log(`✅ Texture copied to: ${savedPath}`);
+            
+            // Get file info
+            const sourceFullPath = path.join(__dirname, '../Frontend/public', textureSource);
+            const stats = await fs.promises.stat(sourceFullPath);
+            
+            textureFiles.push({
+              originalName: path.basename(textureSource),
+              savedPath: savedPath,
+              configKey: textureKey,
+              fileSize: stats.size,
+              mimeType: `image/${path.extname(textureSource).substring(1)}`,
+              uploadedAt: new Date()
+            });
+            
+            // Update the texture info with the new path
+            configData.textureSettings[textureKey].savedTexturePath = savedPath;
+            
+          } catch (error) {
+            console.warn(`Failed to copy texture file for key ${textureKey}:`, error);
+          }
+        } else {
+          console.log(`⏭️ Skipping texture ${textureKey}: not a file path (${textureSource})`);
+        }
+      }
+      
+      // Update the configuration with texture files and updated paths
+      savedConfig.textureFiles = textureFiles;
+      savedConfig.configData = configData;
+      await savedConfig.save();
+    }
+    
+    res.status(201).json({
+      message: "Configuration saved successfully",
+      config: savedConfig,
+      textureFilesCopied: savedConfig.textureFiles.length
+    });
+  } catch (error) {
+    console.error("Save configuration error:", error);
+    res.status(500).json({ message: "Error saving configuration", error: error.message });
+  }
+});
+
+// Get user's saved configurations
+app.get("/api/configs/user", authMiddleware, async (req, res) => {
+  try {
+    const { modelName } = req.query;
+    
+    const filter = { userId: req.user._id };
+    if (modelName) {
+      filter.modelName = modelName;
+    }
+
+    const configs = await SavedConfiguration.find(filter)
+      .sort({ updatedAt: -1 })
+      .populate('userId', 'name email');
+    
+    res.json(configs);
+  } catch (error) {
+    console.error("Get user configurations error:", error);
+    res.status(500).json({ message: "Error fetching configurations", error: error.message });
+  }
+});
+
+// Get specific configuration by ID
+app.get("/api/configs/:id", authMiddleware, async (req, res) => {
+  try {
+    const config = await SavedConfiguration.findOne({
+      _id: req.params.id,
+      $or: [
+        { userId: req.user._id },  // User's own config
+        { isPublic: true }         // Or public config
+      ]
+    }).populate('userId', 'name email');
+
+    if (!config) {
+      return res.status(404).json({ message: "Configuration not found or access denied" });
+    }
+
+    res.json(config);
+  } catch (error) {
+    console.error("Get configuration error:", error);
+    res.status(500).json({ message: "Error fetching configuration", error: error.message });
+  }
+});
+
+// Delete configuration
+app.delete("/api/configs/:id", authMiddleware, async (req, res) => {
+  try {
+    const config = await SavedConfiguration.findOneAndDelete({
+      _id: req.params.id,
+      userId: req.user._id
+    });
+
+    if (!config) {
+      return res.status(404).json({ message: "Configuration not found or access denied" });
+    }
+
+    // Clean up texture files associated with this configuration
+    await cleanupConfigTextures(config._id.toString());
+
+    res.json({ message: "Configuration deleted successfully" });
+  } catch (error) {
+    console.error("Delete configuration error:", error);
+    res.status(500).json({ message: "Error deleting configuration", error: error.message });
+  }
+});
+
+// Serve configuration texture files
+app.use('/config-textures', express.static(path.join(__dirname, '../Frontend/public/config-textures')));
 
 // Start server on network IP
 const PORT = process.env.PORT || 5000;
