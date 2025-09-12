@@ -52,6 +52,9 @@ app.use(express.urlencoded({ limit: '50mb', extended: true })); // Also increase
 
 // Serve uploaded models statically from backend
 app.use('/models', express.static(path.join(__dirname, '../Frontend/public/models')));
+// Serve textures statically from backend  
+app.use('/textures', express.static(path.join(__dirname, '../Frontend/public/textures')));
+app.use('/texture', express.static(path.join(__dirname, '../Frontend/public/texture')));
 
 // Connect to MongoDB
 const MONGODB_URI = process.env.MONGO_URI || "mongodb://localhost:27017/3dconfigurator";
@@ -73,6 +76,10 @@ const UserSchema = new mongoose.Schema({
     textureWidget: { type: Boolean, default: false },
     lightWidget: { type: Boolean, default: false },
     globalTextureWidget: { type: Boolean, default: false },
+    // Add missing widget permissions
+    reflectionWidget: { type: Boolean, default: false },
+    movementWidget: { type: Boolean, default: false },
+    customWidget: { type: Boolean, default: false },
     saveConfig: { type: Boolean, default: false },
     canRotate: { type: Boolean, default: true },
     canPan: { type: Boolean, default: false },
@@ -308,6 +315,10 @@ const ensureDefaultAccounts = async () => {
       textureWidget: true,
       lightWidget: true,
       globalTextureWidget: true,
+      // Add missing widget permissions
+      reflectionWidget: true,
+      movementWidget: true,
+      customWidget: true,
       saveConfig: true,
       canRotate: true,
       canPan: true,
@@ -788,20 +799,28 @@ app.get("/api/models", async (req, res) => {
     const models = await Model.find({ status: 'active' }).select('-uploadedBy -createdAt -updatedAt');
     
     // Convert to format expected by frontend
-    const formattedModels = models.map(model => ({
-      id: model._id,
-      name: model.name,
-      displayName: model.displayName,
-      file: `http://localhost:5000/models/${model.file}`,
-      type: model.type,
-      interactionGroups: model.interactionGroups || [],
-  metadata: model.metadata || {},
-  // Expose admin-defined placement/transform so the viewer can apply it
-  placementMode: model.placementMode || 'autofit',
-  modelPosition: Array.isArray(model.modelPosition) ? model.modelPosition : undefined,
-  modelRotation: Array.isArray(model.modelRotation) ? model.modelRotation : undefined,
-  modelScale: typeof model.modelScale === 'number' ? model.modelScale : undefined
-    }));
+    const formattedModels = models.map(model => {
+      const meta = model.metadata || {};
+      // Normalize uiWidgets: prefer top-level uiWidgets, fallback to metadata.uiWidgets
+      const uiWidgets = Array.isArray(model.uiWidgets) && model.uiWidgets.length
+        ? model.uiWidgets
+        : (Array.isArray(meta.uiWidgets) ? meta.uiWidgets : []);
+
+      return {
+        id: model._id,
+        name: model.name,
+        displayName: model.displayName,
+        file: `http://localhost:5000/models/${model.file}`,
+        type: model.type,
+        interactionGroups: model.interactionGroups || [],
+        metadata: { ...meta, uiWidgets },
+        // Expose admin-defined placement/transform so the viewer can apply it
+        placementMode: model.placementMode || 'autofit',
+        modelPosition: Array.isArray(model.modelPosition) ? model.modelPosition : undefined,
+        modelRotation: Array.isArray(model.modelRotation) ? model.modelRotation : undefined,
+        modelScale: typeof model.modelScale === 'number' ? model.modelScale : undefined
+      };
+    });
     
     console.log('=== MODELS API DEBUG ===');
     console.log('Raw models from DB:', models.length);
@@ -1010,11 +1029,11 @@ app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => 
       file: filename,
       type: 'glb',
       interactionGroups: config.interactionGroups || [],
+      uiWidgets: config.uiWidgets || [],
       metadata: {
         camera: config.camera, // may be null now
         hiddenInitially: config.hiddenInitially || [],
-        lights: config.lights || [],
-        uiWidgets: config.uiWidgets || []
+        lights: config.lights || []
       },
       // Admin-defined transform (optional)
       modelPosition: config.modelPosition,
