@@ -55,6 +55,8 @@ app.use('/models', express.static(path.join(__dirname, '../Frontend/public/model
 // Serve textures statically from backend  
 app.use('/textures', express.static(path.join(__dirname, '../Frontend/public/textures')));
 app.use('/texture', express.static(path.join(__dirname, '../Frontend/public/texture')));
+// Serve developer-provided JSON configs
+app.use('/configs', express.static(path.join(__dirname, '../Frontend/public/configs')));
 
 // Connect to MongoDB
 const MONGODB_URI = process.env.MONGO_URI || "mongodb://localhost:27017/3dconfigurator";
@@ -98,6 +100,8 @@ const ModelSchema = new mongoose.Schema({
   file: { type: String, required: true },
   type: { type: String, required: true },
   status: { type: String, enum: ['active', 'inactive'], default: 'active' },
+  // External developer-provided config JSON URL or path (e.g., '/configs/xyz.json' or full http URL)
+  configUrl: { type: String },
   interactionGroups: mongoose.Schema.Types.Mixed,
   metadata: mongoose.Schema.Types.Mixed,
   // Add explicit fields for configuration data
@@ -806,14 +810,55 @@ app.get("/api/models", async (req, res) => {
         ? model.uiWidgets
         : (Array.isArray(meta.uiWidgets) ? meta.uiWidgets : []);
 
+      // Normalize lights and hiddenInitially from either top-level or metadata (backward compatibility)
+      const lights = Array.isArray(model.lights) && model.lights.length
+        ? model.lights
+        : (Array.isArray(meta.lights) ? meta.lights : []);
+      const hiddenInitially = Array.isArray(model.hiddenInitially) && model.hiddenInitially.length
+        ? model.hiddenInitially
+        : (Array.isArray(meta.hiddenInitially) ? meta.hiddenInitially : []);
+
+      // Normalize asset paths to absolute backend URLs so the frontend (on port 5173) can load them
+      const normalizeAssetPath = (p) => {
+        if (!p || typeof p !== 'string') return undefined;
+        if (p.startsWith('http://') || p.startsWith('https://')) return p;
+        if (p.startsWith('/models/')) return `http://localhost:5000${p}`;
+        // treat as filename
+        return `http://localhost:5000/models/${p}`;
+      };
+      const assetsRaw = model.assets || undefined;
+      // Expose ALL asset keys, not just base/doors/drawers/glassDoors
+      const assets = assetsRaw && typeof assetsRaw === 'object'
+        ? Object.fromEntries(
+            Object.entries(assetsRaw).map(([key, value]) => [key, normalizeAssetPath(value)])
+          )
+        : undefined;
+
+      // Normalize config URL to absolute so the frontend can fetch it regardless of port
+      const normalizeConfigUrl = (u) => {
+        if (!u || typeof u !== 'string') return undefined;
+        if (u.startsWith('http://') || u.startsWith('https://')) return u;
+        if (u.startsWith('/')) return `http://localhost:5000${u}`;
+        return `http://localhost:5000/${u}`;
+      };
+
       return {
         id: model._id,
         name: model.name,
         displayName: model.displayName,
         file: `http://localhost:5000/models/${model.file}`,
         type: model.type,
+        // Fallback to metadata.configUrl for legacy/older records
+        configUrl: normalizeConfigUrl(model.configUrl || meta.configUrl) || undefined,
         interactionGroups: model.interactionGroups || [],
         metadata: { ...meta, uiWidgets },
+        // Also expose commonly used fields at top-level for the viewer
+        uiWidgets,
+        lights,
+        hiddenInitially,
+        camera: model.camera || meta.camera || undefined,
+        assets,
+        presets: model.presets || undefined,
         // Expose admin-defined placement/transform so the viewer can apply it
         placementMode: model.placementMode || 'autofit',
         modelPosition: Array.isArray(model.modelPosition) ? model.modelPosition : undefined,
@@ -826,6 +871,14 @@ app.get("/api/models", async (req, res) => {
     console.log('Raw models from DB:', models.length);
     if (models.length > 0) {
       console.log('Sample model metadata:', models[0].metadata);
+      console.log('Sample exposed fields (top-level):', {
+        uiWidgets: formattedModels[0]?.uiWidgets?.length || 0,
+        lights: formattedModels[0]?.lights?.length || 0,
+        hiddenInitially: formattedModels[0]?.hiddenInitially?.length || 0,
+        hasCamera: !!formattedModels[0]?.camera,
+        hasAssets: !!formattedModels[0]?.assets,
+        hasPresets: !!formattedModels[0]?.presets,
+      });
       console.log('Sample placement fields:', {
         placementMode: models[0].placementMode,
         modelPosition: models[0].modelPosition,
@@ -833,7 +886,7 @@ app.get("/api/models", async (req, res) => {
         modelScale: models[0].modelScale
       });
     }
-    console.log('Formatted models (with placement fields):', formattedModels);
+    console.log('Formatted models (with placement & assets):', formattedModels);
     console.log('=======================');
     
     res.json(formattedModels);
@@ -998,7 +1051,7 @@ app.post("/api/upload-texture", authMiddleware, uploadTexture.single('texture'),
 // Save model configuration (when file is already uploaded)
 app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => {
   try {
-    const { name, path, ...config } = req.body;
+    const { name, path, configUrl, assets } = req.body;
     
     if (!name) {
       return res.status(400).json({ message: "Model name is required" });
@@ -1011,45 +1064,29 @@ app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => 
     console.log('=== SAVE MODEL CONFIG DEBUG ===');
     console.log('Name:', name);
     console.log('Path:', path);
-    console.log('Config:', config);
+    console.log('ConfigUrl:', configUrl);
+    console.log('Assets:', assets);
     console.log('===============================');
-    console.log('Incoming placement/transform fields:', {
-      placementMode: config.placementMode,
-      modelPosition: config.modelPosition,
-      modelRotation: config.modelRotation,
-      modelScale: config.modelScale
-    });
+
 
     // Extract filename from path for storage
     const filename = path.split('/').pop();
+
+    // Sanitize configUrl: store as provided (supports external URLs), but trim spaces
+    const sanitizedConfigUrl = typeof configUrl === 'string' ? configUrl.trim() : undefined;
 
     const newModel = new Model({
       name,
       displayName: name,
       file: filename,
       type: 'glb',
-      interactionGroups: config.interactionGroups || [],
-      uiWidgets: config.uiWidgets || [],
-      metadata: {
-        camera: config.camera, // may be null now
-        hiddenInitially: config.hiddenInitially || [],
-        lights: config.lights || []
-      },
-      // Admin-defined transform (optional)
-      modelPosition: config.modelPosition,
-      modelRotation: config.modelRotation,
-      modelScale: config.modelScale,
-      placementMode: config.placementMode || 'autofit',
+      configUrl: sanitizedConfigUrl,
+      assets: assets, // Add assets field
       uploadedBy: req.user._id
     });
 
     await newModel.save();
-    console.log('Persisted placement/transform fields:', {
-      placementMode: newModel.placementMode,
-      modelPosition: newModel.modelPosition,
-      modelRotation: newModel.modelRotation,
-      modelScale: newModel.modelScale
-    });
+    // Placement/transform fields are managed via external config JSON; none are persisted here.
     await newModel.populate('uploadedBy', 'name email');
 
     console.log('=== MODEL SAVED ===');
@@ -1071,54 +1108,21 @@ app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => 
 app.put("/api/admin/models/:id", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { 
-      name, 
-      displayName, 
-      type, 
-      status, 
-      interactionGroups, 
-      metadata,
-      camera,
-      lights,
-      hiddenInitially,
-      uiWidgets,
-      assets,
-      presets,
-      placementMode,
-      modelPosition,
-      modelRotation,
-      modelScale
-    } = req.body;
+    const { name, displayName, type, status, file, path: filePath, configUrl, assets } = req.body;
 
-    const updateData = {
-      name,
-      displayName,
-      type,
-      status,
-      interactionGroups,
-      metadata
-    };
-
-    // Add optional fields if they exist
-    if (camera) updateData.camera = camera;
-    if (lights) updateData.lights = lights;
-    if (hiddenInitially) updateData.hiddenInitially = hiddenInitially;
-    if (uiWidgets) updateData.uiWidgets = uiWidgets;
-    if (assets) updateData.assets = assets;
-    if (presets) updateData.presets = presets;
-  if (placementMode) updateData.placementMode = placementMode;
-  if (Array.isArray(modelPosition)) updateData.modelPosition = modelPosition;
-  if (Array.isArray(modelRotation)) updateData.modelRotation = modelRotation;
-  if (typeof modelScale === 'number') updateData.modelScale = modelScale;
-  if (presets) updateData.presets = presets;
+    const updateData = {};
+    if (typeof name === 'string') updateData.name = name;
+    if (typeof displayName === 'string') updateData.displayName = displayName;
+    if (typeof type === 'string') updateData.type = type;
+    if (typeof status === 'string') updateData.status = status;
+    if (typeof configUrl === 'string') updateData.configUrl = configUrl.trim();
+    if (assets !== undefined) updateData.assets = assets; // Add assets field
+    // Allow updating file via either file or path (use filename only)
+    if (typeof file === 'string') updateData.file = file.split('/').pop();
+    if (typeof filePath === 'string') updateData.file = filePath.split('/').pop();
 
     console.log('=== UPDATE MODEL DEBUG ===');
-    console.log('Incoming placement/transform fields:', {
-      placementMode,
-      modelPosition,
-      modelRotation,
-      modelScale
-    });
+    console.log('Incoming basic fields:', updateData);
 
     const model = await Model.findByIdAndUpdate(
       id,
@@ -1161,16 +1165,45 @@ app.delete("/api/admin/models/:id", authMiddleware, requireAdmin, async (req, re
       return res.status(404).json({ message: "Model not found" });
     }
 
-    // Delete the file
+    // Delete the main model file
     const filePath = path.join(__dirname, '../Frontend/public/models', model.file);
-    console.log('File path to delete:', filePath);
-    console.log('File exists:', fs.existsSync(filePath));
-    
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
-      console.log('File deleted successfully');
-    } else {
-      console.log('File does not exist, skipping file deletion');
+      console.log('Main model file deleted:', filePath);
+    }
+
+    // Delete config JSON if local
+    if (model.configUrl && typeof model.configUrl === 'string' && model.configUrl.startsWith('/configs/')) {
+      const configPath = path.join(__dirname, '../Frontend/public', model.configUrl);
+      if (fs.existsSync(configPath)) {
+        fs.unlinkSync(configPath);
+        console.log('Config JSON deleted:', configPath);
+      }
+    }
+
+    // Delete asset files if local
+    if (model.assets && typeof model.assets === 'object') {
+      Object.values(model.assets).forEach(assetPath => {
+        if (typeof assetPath === 'string') {
+          let fileToDelete;
+          if (assetPath.startsWith('/models/')) {
+            // Relative path
+            fileToDelete = path.join(__dirname, '../Frontend/public', assetPath);
+          } else if (assetPath.includes('/models/')) {
+            // Full URL - extract filename
+            const urlParts = assetPath.split('/models/');
+            if (urlParts.length > 1) {
+              const filename = urlParts[1];
+              fileToDelete = path.join(__dirname, '../Frontend/public/models', filename);
+            }
+          }
+
+          if (fileToDelete && fs.existsSync(fileToDelete)) {
+            fs.unlinkSync(fileToDelete);
+            console.log('Asset file deleted:', fileToDelete);
+          }
+        }
+      });
     }
 
     await Model.findByIdAndDelete(id);
@@ -1383,4 +1416,68 @@ app.listen(PORT, HOST, () => {
   console.log(`🌐 Local access: http://localhost:${PORT}`);
   console.log(`🌐 Network access: http://192.168.1.7:${PORT}`);
   console.log(`🌐 Health check: http://192.168.1.7:${PORT}/api/health`);
+});
+
+// Upload developer config JSON
+// Upload developer config JSON (primary route)
+app.post('/api/upload-config', authMiddleware, requireAdmin, (req, res, next) => {
+  next();
+}, uploadConfigMiddleware);
+
+// Backward-compatible alias under admin namespace
+app.post('/api/admin/configs/upload', authMiddleware, requireAdmin, (req, res, next) => {
+  next();
+}, uploadConfigMiddleware);
+
+function uploadConfigMiddleware(req, res) {
+  const upload = multer({
+    storage: multer.diskStorage({
+      destination: function (req, file, cb) {
+        const uploadPath = path.join(__dirname, '../Frontend/public/configs');
+        if (!fs.existsSync(uploadPath)) {
+          fs.mkdirSync(uploadPath, { recursive: true });
+        }
+        cb(null, uploadPath);
+      },
+      filename: function (req, file, cb) {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, 'config-' + uniqueSuffix + path.extname(file.originalname));
+      }
+    }),
+    limits: { fileSize: 2 * 1024 * 1024 },
+    fileFilter: function (req, file, cb) {
+      const ext = path.extname(file.originalname).toLowerCase();
+      if (ext === '.json') return cb(null, true);
+      cb(new Error('Only JSON config files are allowed (.json)'));
+    }
+  }).single('file');
+
+  upload(req, res, function (err) {
+    if (err) {
+      return res.status(400).json({ message: err.message });
+    }
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded' });
+    }
+    const filePath = `/configs/${req.file.filename}`;
+    console.log(`📤 Config uploaded successfully: ${filePath}`);
+    res.status(200).json({ message: 'Config uploaded successfully', path: filePath, filename: req.file.filename, originalName: req.file.originalname });
+  });
+}
+
+// Express global error handler (handles request aborted and other body parse errors)
+app.use((err, req, res, next) => {
+  if (err) {
+    // Quietly handle very common client-side aborts to avoid console spam
+    if (err.message === 'request aborted') {
+      return res.status(400).json({ message: err.message });
+    }
+    if (err.type === 'entity.too.large') {
+      console.warn('⚠️ Request body too large');
+      return res.status(413).json({ message: 'Payload too large' });
+    }
+    console.error('Unhandled error:', err);
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+  next();
 });
