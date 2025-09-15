@@ -1518,3 +1518,50 @@ app.use((err, req, res, next) => {
   }
   next();
 });
+
+// Configure multer for JSON config uploads
+const configsStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadPath = path.join(__dirname, '../Frontend/public/configs');
+    if (!fs.existsSync(uploadPath)) {
+      fs.mkdirSync(uploadPath, { recursive: true });
+    }
+    cb(null, uploadPath);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    // Preserve original extension
+    cb(null, 'config-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const uploadConfig = multer({
+  storage: configsStorage,
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB for JSON configs
+  fileFilter: function (req, file, cb) {
+    const allowed = ['.json'];
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (allowed.includes(ext)) cb(null, true);
+    else cb(new Error('Only JSON files are allowed for configs'), false);
+  }
+});
+
+// Upload config JSON
+app.post('/api/upload-config', authMiddleware, requireAdmin, uploadConfig.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No config file uploaded' });
+    }
+
+    const filePath = `/configs/${req.file.filename}`;
+    console.log(`Config uploaded: ${filePath}`);
+    res.status(200).json({ message: 'Config uploaded successfully', path: filePath, filename: req.file.filename });
+  } catch (error) {
+    console.error('Config upload error:', error);
+    if (req.file) {
+      const fileToDelete = path.join(__dirname, '../Frontend/public/configs', req.file.filename);
+      if (fs.existsSync(fileToDelete)) fs.unlinkSync(fileToDelete);
+    }
+    res.status(500).json({ message: 'Error uploading config', error: error.message });
+  }
+});
