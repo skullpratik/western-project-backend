@@ -214,6 +214,134 @@ const uploadTexture = multer({
   }
 });
 
+// Helper functions for asset parsing and deletion
+function analyzeAssetString(assetStr) {
+  if (!assetStr || typeof assetStr !== 'string') return null;
+  
+  let relPath = assetStr;
+  let type = 'models'; // default
+  
+  // Handle full URLs
+  if (assetStr.startsWith('http://') || assetStr.startsWith('https://')) {
+    if (assetStr.includes('/models/')) {
+      relPath = assetStr.split('/models/')[1];
+      type = 'models';
+    } else if (assetStr.includes('/configs/')) {
+      relPath = assetStr.split('/configs/')[1];
+      type = 'configs';
+    } else if (assetStr.includes('/texture/') || assetStr.includes('/textures/')) {
+      relPath = assetStr.split('/texture')[1] || assetStr.split('/textures/')[1];
+      type = 'texture';
+    }
+  } 
+  // Handle relative paths
+  else if (assetStr.startsWith('/models/')) {
+    relPath = assetStr.substring(8);
+    type = 'models';
+  } else if (assetStr.startsWith('/configs/')) {
+    relPath = assetStr.substring(9);
+    type = 'configs';
+  } else if (assetStr.startsWith('/texture/') || assetStr.startsWith('/textures/')) {
+    relPath = assetStr.substring(9);
+    type = 'texture';
+  } else if (assetStr.startsWith('texture/') || assetStr.startsWith('textures/')) {
+    relPath = assetStr.substring(8);
+    type = 'texture';
+  }
+  // Bare filename - assume models
+  else {
+    relPath = assetStr;
+    type = 'models';
+  }
+  
+  return { relPath, type };
+}
+
+function collectAssetStrings(value) {
+  const assets = { models: new Set(), configs: new Set(), texture: new Set() };
+  
+  function recurse(obj) {
+    if (typeof obj === 'string') {
+      const analyzed = analyzeAssetString(obj);
+      if (analyzed) {
+        assets[analyzed.type].add(analyzed.relPath);
+      }
+    } else if (Array.isArray(obj)) {
+      obj.forEach(recurse);
+    } else if (obj && typeof obj === 'object') {
+      Object.values(obj).forEach(recurse);
+    }
+  }
+  
+  recurse(value);
+  return assets;
+}
+
+async function performModelDeletion(model) {
+  const report = { deleted: [], notFound: [], errors: [] };
+  
+  try {
+    // Collect all assets
+    const allAssets = collectAssetStrings(model);
+    
+    // Add main file
+    if (model.file) {
+      allAssets.models.add(model.file);
+    }
+    
+    // Add config if local
+    if (model.configUrl && typeof model.configUrl === 'string' && model.configUrl.startsWith('/configs/')) {
+      const configRel = model.configUrl.substring(9);
+      allAssets.configs.add(configRel);
+    }
+    
+    // Delete files
+    const baseDir = path.join(__dirname, '../Frontend/public');
+    
+    for (const [type, files] of Object.entries(allAssets)) {
+      const dirName = type === 'texture' ? 'texture' : type;
+      const dirPath = path.join(baseDir, dirName);
+      
+      for (const file of files) {
+        const filePath = path.join(dirPath, file);
+        
+        // Try direct path
+        if (fs.existsSync(filePath)) {
+          try {
+            fs.unlinkSync(filePath);
+            report.deleted.push(`${type}/${file}`);
+          } catch (err) {
+            report.errors.push(`Failed to delete ${type}/${file}: ${err.message}`);
+          }
+        } else {
+          // Try basename in models dir (fallback for malformed paths)
+          const basename = path.basename(file);
+          const fallbackPath = path.join(baseDir, 'models', basename);
+          if (fs.existsSync(fallbackPath)) {
+            try {
+              fs.unlinkSync(fallbackPath);
+              report.deleted.push(`models/${basename} (fallback)`);
+            } catch (err) {
+              report.errors.push(`Failed to delete models/${basename}: ${err.message}`);
+            }
+          } else {
+            report.notFound.push(`${type}/${file}`);
+          }
+        }
+      }
+    }
+    
+    // Delete from DB
+    await Model.findByIdAndDelete(model._id);
+    report.deleted.push('database record');
+    
+  } catch (error) {
+    report.errors.push(`Deletion error: ${error.message}`);
+  }
+  
+  return report;
+}
+
 // Utility function to copy texture files for configuration storage
 async function copyTextureForConfig(sourcePath, configId, textureKey) {
   try {
@@ -1249,55 +1377,86 @@ app.delete("/api/admin/models/:id", authMiddleware, requireAdmin, async (req, re
       return res.status(404).json({ message: "Model not found" });
     }
 
-    // Delete the main model file
-    const filePath = path.join(__dirname, '../Frontend/public/models', model.file);
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      console.log('Main model file deleted:', filePath);
-    }
-
-    // Delete config JSON if local
-    if (model.configUrl && typeof model.configUrl === 'string' && model.configUrl.startsWith('/configs/')) {
-      const configPath = path.join(__dirname, '../Frontend/public', model.configUrl);
-      if (fs.existsSync(configPath)) {
-        fs.unlinkSync(configPath);
-        console.log('Config JSON deleted:', configPath);
-      }
-    }
-
-    // Delete asset files if local
-    if (model.assets && typeof model.assets === 'object') {
-      Object.values(model.assets).forEach(assetPath => {
-        if (typeof assetPath === 'string') {
-          let fileToDelete;
-          if (assetPath.startsWith('/models/')) {
-            // Relative path
-            fileToDelete = path.join(__dirname, '../Frontend/public', assetPath);
-          } else if (assetPath.includes('/models/')) {
-            // Full URL - extract filename
-            const urlParts = assetPath.split('/models/');
-            if (urlParts.length > 1) {
-              const filename = urlParts[1];
-              fileToDelete = path.join(__dirname, '../Frontend/public/models', filename);
-            }
-          }
-
-          if (fileToDelete && fs.existsSync(fileToDelete)) {
-            fs.unlinkSync(fileToDelete);
-            console.log('Asset file deleted:', fileToDelete);
-          }
-        }
-      });
-    }
-
-    await Model.findByIdAndDelete(id);
-    console.log('Model deleted from database');
+    const report = await performModelDeletion(model);
+    console.log('Deletion report:', report);
     console.log('========================');
 
-    res.json({ message: "Model deleted successfully" });
+    res.json({ 
+      message: "Model deleted successfully", 
+      report 
+    });
   } catch (error) {
     console.error("Delete model error:", error);
     res.status(500).json({ message: "Error deleting model", error: error.message });
+  }
+});
+
+// Preview deletion (non-destructive)
+app.get("/api/admin/models/:id/delete-preview", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const model = await Model.findById(id);
+    
+    if (!model) {
+      return res.status(404).json({ message: "Model not found" });
+    }
+
+    // Collect candidate files
+    const allAssets = collectAssetStrings(model);
+    if (model.file) allAssets.models.add(model.file);
+    if (model.configUrl && typeof model.configUrl === 'string' && model.configUrl.startsWith('/configs/')) {
+      const configRel = model.configUrl.substring(9);
+      allAssets.configs.add(configRel);
+    }
+
+    const baseDir = path.join(__dirname, '../Frontend/public');
+    const candidates = [];
+
+    for (const [type, files] of Object.entries(allAssets)) {
+      const dirName = type === 'texture' ? 'texture' : type;
+      const dirPath = path.join(baseDir, dirName);
+      
+      for (const file of files) {
+        const filePath = path.join(dirPath, file);
+        const exists = fs.existsSync(filePath);
+        candidates.push({
+          rel: `${type}/${file}`,
+          fullPath: filePath,
+          exists
+        });
+      }
+    }
+
+    res.json({
+      model: { id: model._id, name: model.name, file: model.file },
+      candidates,
+      totalCandidates: candidates.length,
+      existingFiles: candidates.filter(c => c.exists).length
+    });
+  } catch (error) {
+    console.error("Preview error:", error);
+    res.status(500).json({ message: "Error generating preview", error: error.message });
+  }
+});
+
+// Force delete (aggressive cleanup)
+app.post("/api/admin/models/:id/force-delete", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const model = await Model.findById(id);
+    
+    if (!model) {
+      return res.status(404).json({ message: "Model not found" });
+    }
+
+    const report = await performModelDeletion(model);
+    res.json({ 
+      message: "Force delete completed", 
+      report 
+    });
+  } catch (error) {
+    console.error("Force delete error:", error);
+    res.status(500).json({ message: "Error force deleting model", error: error.message });
   }
 });
 
