@@ -916,28 +916,53 @@ app.get("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => {
 });
 
 // Upload new model
-app.post("/api/admin/models/upload", authMiddleware, requireAdmin, upload.single('modelFile'), async (req, res) => {
+// Multi-file upload: expects fields like base, doors, drawers, etc.
+app.post("/api/admin/models/upload", authMiddleware, requireAdmin, upload.fields([
+  { name: 'base', maxCount: 1 },
+  { name: 'doors', maxCount: 1 },
+  { name: 'drawers', maxCount: 1 },
+  { name: 'glassDoors', maxCount: 1 },
+  { name: 'other', maxCount: 1 }
+]), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ message: "No file uploaded" });
-    }
-
+    console.log('=== MODEL UPLOAD START ===');
     const { name, displayName, type, interactionGroups, metadata } = req.body;
-    
+    console.log('Received fields:', { name, displayName, type });
+    console.log('Files received:', Object.keys(req.files || {}));
+
     // Parse JSON strings
     const parsedInteractionGroups = interactionGroups ? JSON.parse(interactionGroups) : [];
     const parsedMetadata = metadata ? JSON.parse(metadata) : {};
-
-    console.log('=== UPLOAD DEBUG ===');
     console.log('Parsed Interaction Groups:', parsedInteractionGroups);
     console.log('Parsed Metadata:', parsedMetadata);
-    console.log('====================');
+
+    // Build assets object from uploaded files with full URLs
+    const assets = {};
+    const assetUrls = {};
+    ['base', 'doors', 'drawers', 'glassDoors', 'other'].forEach(key => {
+      if (req.files && req.files[key] && req.files[key][0]) {
+        const filename = req.files[key][0].filename;
+        assets[key] = filename;
+        assetUrls[key] = `http://localhost:5000/models/${filename}`;
+        console.log(`Asset registered: ${key} -> ${filename}`);
+      } else {
+        console.log(`Asset missing: ${key}`);
+      }
+    });
+
+    // Use base as main file if present
+    const mainFile = assets.base || (req.files && req.files.base && req.files.base[0] && req.files.base[0].filename);
+    if (!mainFile) {
+      console.error('No base model file uploaded.');
+      return res.status(400).json({ message: "No base model file uploaded" });
+    }
 
     const newModel = new Model({
       name,
       displayName,
-      file: req.file.filename,
+      file: mainFile,
       type,
+      assets,
       interactionGroups: parsedInteractionGroups,
       metadata: parsedMetadata,
       uploadedBy: req.user._id
@@ -946,20 +971,79 @@ app.post("/api/admin/models/upload", authMiddleware, requireAdmin, upload.single
     await newModel.save();
     await newModel.populate('uploadedBy', 'name email');
 
+    // Generate JSON configuration template with asset URLs
+    const jsonConfigTemplate = {
+      name: name || displayName,
+      path: `http://localhost:5000/models/${mainFile}`,
+      assets: assetUrls,
+      camera: {
+        position: [0, 2, 5],
+        target: [0, 1, 0],
+        fov: 50
+      },
+      placementMode: "autofit",
+      hiddenInitially: [],
+      interactionGroups: parsedInteractionGroups.length > 0 ? parsedInteractionGroups : [
+        // Example interaction groups - admin can modify these
+        {
+          type: "doors",
+          label: "Doors",
+          parts: []
+        },
+        {
+          type: "drawers",
+          label: "Drawers",
+          parts: []
+        }
+      ],
+      presets: {
+        doorSelections: {}
+      },
+      doorTypeMap: {
+        toGlass: {},
+        toSolid: {}
+      },
+      uiWidgets: [],
+      lights: [],
+      metadata: {
+        ...parsedMetadata,
+        solidDoorMeshPrefixes: [],
+        panels: [],
+        glassPanels: [],
+        drawers: {
+          targetGroups: [],
+          closedZ: 0,
+          openZ: 0
+        }
+      }
+    };
+
+    console.log('Model saved:', newModel);
+    console.log('Generated JSON config template:', JSON.stringify(jsonConfigTemplate, null, 2));
+    
     res.status(201).json({
       message: "Model uploaded successfully",
-      model: newModel
+      model: newModel,
+      jsonConfig: jsonConfigTemplate,
+      assetUrls: assetUrls
     });
+    console.log('=== MODEL UPLOAD END ===');
   } catch (error) {
     console.error("Upload model error:", error);
-    // Clean up uploaded file on error
-    if (req.file) {
-      const filePath = path.join(__dirname, '../Frontend/public/models', req.file.filename);
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
+    // Clean up uploaded files on error
+    if (req.files) {
+      Object.values(req.files).forEach(arr => {
+        arr.forEach(fileObj => {
+          const filePath = path.join(__dirname, '../Frontend/public/models', fileObj.filename);
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            console.log(`Deleted file due to error: ${fileObj.filename}`);
+          }
+        });
+      });
     }
     res.status(500).json({ message: "Error uploading model", error: error.message });
+    console.log('=== MODEL UPLOAD ERROR END ===');
   }
 });
 
@@ -1417,53 +1501,6 @@ app.listen(PORT, HOST, () => {
   console.log(`🌐 Network access: http://192.168.1.7:${PORT}`);
   console.log(`🌐 Health check: http://192.168.1.7:${PORT}/api/health`);
 });
-
-// Upload developer config JSON
-// Upload developer config JSON (primary route)
-app.post('/api/upload-config', authMiddleware, requireAdmin, (req, res, next) => {
-  next();
-}, uploadConfigMiddleware);
-
-// Backward-compatible alias under admin namespace
-app.post('/api/admin/configs/upload', authMiddleware, requireAdmin, (req, res, next) => {
-  next();
-}, uploadConfigMiddleware);
-
-function uploadConfigMiddleware(req, res) {
-  const upload = multer({
-    storage: multer.diskStorage({
-      destination: function (req, file, cb) {
-        const uploadPath = path.join(__dirname, '../Frontend/public/configs');
-        if (!fs.existsSync(uploadPath)) {
-          fs.mkdirSync(uploadPath, { recursive: true });
-        }
-        cb(null, uploadPath);
-      },
-      filename: function (req, file, cb) {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, 'config-' + uniqueSuffix + path.extname(file.originalname));
-      }
-    }),
-    limits: { fileSize: 2 * 1024 * 1024 },
-    fileFilter: function (req, file, cb) {
-      const ext = path.extname(file.originalname).toLowerCase();
-      if (ext === '.json') return cb(null, true);
-      cb(new Error('Only JSON config files are allowed (.json)'));
-    }
-  }).single('file');
-
-  upload(req, res, function (err) {
-    if (err) {
-      return res.status(400).json({ message: err.message });
-    }
-    if (!req.file) {
-      return res.status(400).json({ message: 'No file uploaded' });
-    }
-    const filePath = `/configs/${req.file.filename}`;
-    console.log(`📤 Config uploaded successfully: ${filePath}`);
-    res.status(200).json({ message: 'Config uploaded successfully', path: filePath, filename: req.file.filename, originalName: req.file.originalname });
-  });
-}
 
 // Express global error handler (handles request aborted and other body parse errors)
 app.use((err, req, res, next) => {
