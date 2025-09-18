@@ -58,6 +58,9 @@ app.use('/texture', express.static(path.join(__dirname, '../Frontend/public/text
 // Serve developer-provided JSON configs
 app.use('/configs', express.static(path.join(__dirname, '../Frontend/public/configs')));
 
+// API route for updating config files
+app.use('/api/configs', require('./routes/config'));
+
 // Connect to MongoDB
 const MONGODB_URI = process.env.MONGO_URI || "mongodb://localhost:27017/3dconfigurator";
 
@@ -923,9 +926,13 @@ app.get("/api/activity/stats", authMiddleware, async (req, res) => {
   }
 });
 
+
+// Import modelManagement routes
+const modelManagementRoutes = require('./routes/modelManagement');
 // Model Management Routes
 
 // Get active models for users (no auth required for viewing models)
+app.use(modelManagementRoutes);
 app.get("/api/models", async (req, res) => {
   try {
     const models = await Model.find({ status: 'active' }).select('-uploadedBy -createdAt -updatedAt');
@@ -1102,8 +1109,8 @@ app.post("/api/admin/models/upload", authMiddleware, requireAdmin, upload.fields
     // Generate JSON configuration template with asset URLs
     const jsonConfigTemplate = {
       name: name || displayName,
-      path: `http://localhost:5000/models/${mainFile}`,
-      assets: assetUrls,
+      path: `/models/${mainFile}`,
+      assets: Object.fromEntries(Object.entries(assets).map(([k, v]) => [k, `/models/${v}`])),
       camera: {
         position: [0, 2, 5],
         target: [0, 1, 0],
@@ -1146,13 +1153,26 @@ app.post("/api/admin/models/upload", authMiddleware, requireAdmin, upload.fields
       }
     };
 
+    // Write config file to public/configs and update model with configUrl
+    let configUrl = null;
+    try {
+      const { writeModelConfig } = require('./utils/configWriter');
+      configUrl = writeModelConfig(name || displayName, jsonConfigTemplate);
+      newModel.configUrl = configUrl;
+      await newModel.save();
+      console.log('Config file written at:', configUrl);
+    } catch (configErr) {
+      console.error('❌ Error writing config file:', configErr);
+      return res.status(500).json({ message: 'Model uploaded but failed to write config file', error: configErr.message });
+    }
+
     console.log('Model saved:', newModel);
     console.log('Generated JSON config template:', JSON.stringify(jsonConfigTemplate, null, 2));
-    
+
     res.status(201).json({
       message: "Model uploaded successfully",
       model: newModel,
-      jsonConfig: jsonConfigTemplate,
+      configUrl,
       assetUrls: assetUrls
     });
     console.log('=== MODEL UPLOAD END ===');
