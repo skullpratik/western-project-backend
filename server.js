@@ -81,6 +81,7 @@ const UserSchema = new mongoose.Schema({
     textureWidget: { type: Boolean, default: false },
     lightWidget: { type: Boolean, default: false },
     globalTextureWidget: { type: Boolean, default: false },
+    screenshotWidget: { type: Boolean, default: false },
     // Add missing widget permissions
     reflectionWidget: { type: Boolean, default: false },
     movementWidget: { type: Boolean, default: false },
@@ -450,6 +451,7 @@ const ensureDefaultAccounts = async () => {
       textureWidget: true,
       lightWidget: true,
       globalTextureWidget: true,
+      screenshotWidget: true,
       // Add missing widget permissions
       reflectionWidget: true,
       movementWidget: true,
