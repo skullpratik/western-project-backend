@@ -88,7 +88,8 @@ const UserSchema = new mongoose.Schema({
     canRotate: { type: Boolean, default: true },
     canPan: { type: Boolean, default: false },
     canZoom: { type: Boolean, default: false },
-    canMove: { type: Boolean, default: false }
+    canMove: { type: Boolean, default: false },
+    imageDownloadQualities: { type: [String], enum: ['average', 'good', 'best'], default: ['average'] }
   },
   isActive: { type: Boolean, default: true }
 }, { timestamps: true });
@@ -1055,7 +1056,8 @@ app.post("/api/admin/models/upload", authMiddleware, requireAdmin, upload.fields
   { name: 'doors', maxCount: 1 },
   { name: 'drawers', maxCount: 1 },
   { name: 'glassDoors', maxCount: 1 },
-  { name: 'other', maxCount: 1 }
+  { name: 'other', maxCount: 1 },
+  { name: 'config', maxCount: 1 }
 ]), async (req, res) => {
   try {
     console.log('=== MODEL UPLOAD START ===');
@@ -1090,6 +1092,24 @@ app.post("/api/admin/models/upload", authMiddleware, requireAdmin, upload.fields
       return res.status(400).json({ message: "No base model file uploaded" });
     }
 
+
+    // Handle uploaded config file
+    const fs = require('fs');
+    const pathModule = require('path');
+    let configUrl = null;
+    if (req.files && req.files.config && req.files.config[0]) {
+      const configFile = req.files.config[0];
+      const configDir = pathModule.join(__dirname, '../Frontend/public/configs');
+      if (!fs.existsSync(configDir)) {
+        fs.mkdirSync(configDir, { recursive: true });
+      }
+      const newConfigPath = pathModule.join(configDir, `${name}.json`);
+      // Move the uploaded file to the new name
+      fs.renameSync(configFile.path, newConfigPath);
+      configUrl = `/configs/${name}.json`;
+      console.log(`Config saved as: ${configUrl}`);
+    }
+
     const newModel = new Model({
       name,
       displayName,
@@ -1098,7 +1118,8 @@ app.post("/api/admin/models/upload", authMiddleware, requireAdmin, upload.fields
       assets,
       interactionGroups: parsedInteractionGroups,
       metadata: parsedMetadata,
-      uploadedBy: req.user._id
+      uploadedBy: req.user._id,
+      configUrl: configUrl
     });
 
     await newModel.save();
@@ -1151,8 +1172,9 @@ app.post("/api/admin/models/upload", authMiddleware, requireAdmin, upload.fields
       }
     };
 
-    // Write config file to public/configs and update model with configUrl
-    let configUrl = null;
+  // Write config file to public/configs and update model with configUrl
+  // Reuse existing configUrl variable defined earlier for uploaded config file
+  configUrl = configUrl || null;
     try {
       const { writeModelConfig } = require('./utils/configWriter');
       configUrl = writeModelConfig(name || displayName, jsonConfigTemplate);
