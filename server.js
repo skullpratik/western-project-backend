@@ -83,9 +83,7 @@ const UserSchema = new mongoose.Schema({
     globalTextureWidget: { type: Boolean, default: false },
     screenshotWidget: { type: Boolean, default: false },
     // Add missing widget permissions
-    reflectionWidget: { type: Boolean, default: false },
-    movementWidget: { type: Boolean, default: false },
-    customWidget: { type: Boolean, default: false },
+  // Removed reflectionWidget, movementWidget, customWidget
     saveConfig: { type: Boolean, default: false },
     canRotate: { type: Boolean, default: true },
     canPan: { type: Boolean, default: false },
@@ -453,9 +451,7 @@ const ensureDefaultAccounts = async () => {
       globalTextureWidget: true,
       screenshotWidget: true,
       // Add missing widget permissions
-      reflectionWidget: true,
-      movementWidget: true,
-      customWidget: true,
+  // Removed reflectionWidget, movementWidget, customWidget
       saveConfig: true,
       canRotate: true,
       canPan: true,
