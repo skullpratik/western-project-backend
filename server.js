@@ -96,34 +96,9 @@ const UserSchema = new mongoose.Schema({
 
 const User = mongoose.model("User", UserSchema);
 
-// Model Schema for Admin Panel
-const ModelSchema = new mongoose.Schema({
-  name: { type: String, required: true },
-  displayName: { type: String, required: true },
-  file: { type: String, required: true },
-  type: { type: String, required: true },
-  status: { type: String, enum: ['active', 'inactive'], default: 'active' },
-  // External developer-provided config JSON URL or path (e.g., '/configs/xyz.json' or full http URL)
-  configUrl: { type: String },
-  interactionGroups: mongoose.Schema.Types.Mixed,
-  metadata: mongoose.Schema.Types.Mixed,
-  // Add explicit fields for configuration data
-  camera: mongoose.Schema.Types.Mixed,
-  lights: mongoose.Schema.Types.Mixed,
-  hiddenInitially: mongoose.Schema.Types.Mixed,
-  uiWidgets: mongoose.Schema.Types.Mixed,
-  assets: mongoose.Schema.Types.Mixed,
-  presets: mongoose.Schema.Types.Mixed,
-  // Model positioning fields
-  modelPosition: { type: [Number], default: [0, 0, 0] },
-  modelRotation: { type: [Number], default: [0, 0, 0] },
-  modelScale: { type: Number, default: 2 },
-  // Simplified placement mode (autofit = autoFitModel, focused = keep model origin and only set camera)
-  placementMode: { type: String, enum: ['autofit', 'focused'], default: 'autofit' },
-  uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
-}, { timestamps: true });
 
-const Model = mongoose.model("Model", ModelSchema);
+// Use new Model.js schema (with section)
+const Model = require('./models/Model');
 
 // SavedConfiguration Schema for user configurations
 const SavedConfigurationSchema = new mongoose.Schema({
@@ -981,6 +956,7 @@ app.get("/api/models", async (req, res) => {
         name: model.name,
         displayName: model.displayName,
         file: `http://localhost:5000/models/${model.file}`,
+        section: model.section || 'Upright Counter',
         type: model.type,
         // Fallback to metadata.configUrl for legacy/older records
         configUrl: normalizeConfigUrl(model.configUrl || meta.configUrl) || undefined,
@@ -1041,10 +1017,17 @@ const requireAdmin = (req, res, next) => {
 // Get all models
 app.get("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => {
   try {
-    const models = await Model.find().populate('uploadedBy', 'name email');
+    console.log('Admin /api/admin/models requested by user:', req.user?._id, req.user?.email, 'role=', req.user?.role);
+    // Use lean() to return plain objects and avoid potential populate/schema mismatches
+    let query = Model.find();
+    // Only populate if the schema actually has uploadedBy path
+    if (Model.schema.path('uploadedBy')) {
+      query = query.populate('uploadedBy', 'name email');
+    }
+    const models = await query.lean();
     res.json(models);
   } catch (error) {
-    console.error("Get models error:", error);
+    console.error("Get models error:", error, error.stack);
     res.status(500).json({ message: "Error fetching models", error: error.message });
   }
 });
@@ -1113,13 +1096,15 @@ app.post("/api/admin/models/upload", authMiddleware, requireAdmin, upload.fields
     const newModel = new Model({
       name,
       displayName,
+      path: `/models/${mainFile}`,
       file: mainFile,
       type,
       assets,
       interactionGroups: parsedInteractionGroups,
       metadata: parsedMetadata,
       uploadedBy: req.user._id,
-      configUrl: configUrl
+      configUrl: configUrl,
+      section: req.body.section || 'Upright Counter'
     });
 
     await newModel.save();
@@ -1303,13 +1288,15 @@ app.post("/api/upload-texture", authMiddleware, uploadTexture.single('texture'),
 // Save model configuration (when file is already uploaded)
 app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => {
   try {
-    const { name, path, configUrl, assets } = req.body;
-    
+    console.log('Incoming model POST body:', req.body);
+    // Avoid shadowing the Node `path` module by renaming the incoming body field
+    const { name, path: modelPath, configUrl, assets } = req.body;
+
     if (!name) {
       return res.status(400).json({ message: "Model name is required" });
     }
-    
-    if (!path) {
+
+    if (!modelPath) {
       return res.status(400).json({ message: "Model path is required" });
     }
 
@@ -1321,8 +1308,8 @@ app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => 
     console.log('===============================');
 
 
-    // Extract filename from path for storage
-    const filename = path.split('/').pop();
+  // Extract filename from provided modelPath for storage
+  const filename = (modelPath || '').toString().split('/').pop();
 
     // Sanitize configUrl: store as provided (supports external URLs), but trim spaces
     const sanitizedConfigUrl = typeof configUrl === 'string' ? configUrl.trim() : undefined;
@@ -1330,11 +1317,13 @@ app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => 
     const newModel = new Model({
       name,
       displayName: name,
+      path: modelPath,
       file: filename,
       type: 'glb',
       configUrl: sanitizedConfigUrl,
       assets: assets, // Add assets field
-      uploadedBy: req.user._id
+      uploadedBy: req.user._id,
+      section: req.body.section || 'Upright Counter'
     });
 
     await newModel.save();
@@ -1351,7 +1340,7 @@ app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => 
       model: newModel
     });
   } catch (error) {
-    console.error("Save model error:", error);
+    console.error("Save model error:", error, error.stack);
     res.status(500).json({ message: "Error saving model", error: error.message });
   }
 });
@@ -1360,18 +1349,19 @@ app.post("/api/admin/models", authMiddleware, requireAdmin, async (req, res) => 
 app.put("/api/admin/models/:id", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, displayName, type, status, file, path: filePath, configUrl, assets } = req.body;
+  const { name, displayName, type, status, file, path: filePath, configUrl, assets, section } = req.body;
 
-    const updateData = {};
-    if (typeof name === 'string') updateData.name = name;
-    if (typeof displayName === 'string') updateData.displayName = displayName;
-    if (typeof type === 'string') updateData.type = type;
-    if (typeof status === 'string') updateData.status = status;
-    if (typeof configUrl === 'string') updateData.configUrl = configUrl.trim();
-    if (assets !== undefined) updateData.assets = assets; // Add assets field
-    // Allow updating file via either file or path (use filename only)
-    if (typeof file === 'string') updateData.file = file.split('/').pop();
-    if (typeof filePath === 'string') updateData.file = filePath.split('/').pop();
+  const updateData = {};
+  if (typeof name === 'string') updateData.name = name;
+  if (typeof displayName === 'string') updateData.displayName = displayName;
+  if (typeof type === 'string') updateData.type = type;
+  if (typeof status === 'string') updateData.status = status;
+  if (typeof configUrl === 'string') updateData.configUrl = configUrl.trim();
+  if (assets !== undefined) updateData.assets = assets; // Add assets field
+  if (typeof section === 'string') updateData.section = section;
+  // Allow updating file via either file or path (use filename only)
+  if (typeof file === 'string') updateData.file = file.split('/').pop();
+  if (typeof filePath === 'string') updateData.file = filePath.split('/').pop();
 
     console.log('=== UPDATE MODEL DEBUG ===');
     console.log('Incoming basic fields:', updateData);
