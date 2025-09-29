@@ -10,6 +10,14 @@ const fs = require("fs");
 const ActivityLog = require("./models/ActivityLog");
 require("dotenv").config();
 
+// Configurable blacklist for noisy activity actions (comma-separated env var)
+const ACTIVITY_BLACKLIST = new Set(
+  (process.env.ACTIVITY_BLACKLIST || 'MODEL_LOADED')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+
 const app = express();
 
 // Helper to safely extract client IP (supports proxies if X-Forwarded-For present)
@@ -825,12 +833,42 @@ app.get("/api/activity/logs", authMiddleware, async (req, res) => {
   }
 });
 
-// Log model interaction
+// Log model interaction (with simple SHA256 chaining for tamper-evidence)
+const crypto = require('crypto');
+
 app.post("/api/activity/log", authMiddleware, async (req, res) => {
   try {
     const { action, modelName, partName, widgetType, details, visibility = "user" } = req.body;
     const ip = getClientIp(req);
     const userAgent = req.get('User-Agent') || '';
+
+    // Drop blacklisted actions early to avoid storing noisy events
+    if (action && ACTIVITY_BLACKLIST.has(action)) {
+      console.log(`Dropped blacklisted activity action: ${action}`);
+      return res.status(202).json({ message: 'Action ignored' });
+    }
+
+    // Get last log hash to chain
+    const lastLog = await ActivityLog.findOne({}).sort({ createdAt: -1 }).select('hash').lean();
+    const previousHash = lastLog?.hash || null;
+
+    // Build the record payload used for hashing (stable deterministic ordering)
+    const payload = {
+      userId: req.user._id?.toString(),
+      userEmail: req.user.email,
+      action: action,
+      modelName: modelName || "",
+      partName: partName || "",
+      widgetType: widgetType || "",
+      details: details || {},
+      ipAddress: ip,
+      userAgent: userAgent,
+      timestamp: new Date().toISOString(),
+      previousHash: previousHash
+    };
+
+    const payloadString = JSON.stringify(payload);
+    const hash = crypto.createHash('sha256').update(payloadString).digest('hex');
 
     const log = await ActivityLog.create({
       userId: req.user._id,
@@ -844,13 +882,79 @@ app.post("/api/activity/log", authMiddleware, async (req, res) => {
       partName: partName || "",
       widgetType: widgetType || "",
       visibility: visibility,
-      timestamp: new Date()
+      timestamp: new Date(),
+      previousHash,
+      hash
     });
 
     res.json({ message: "Activity logged successfully", log });
   } catch (error) {
     console.error("Activity logging error:", error);
     res.status(500).json({ message: "Error logging activity", error: error.message });
+  }
+});
+
+// Reusable helper to append an ActivityLog entry (keeps chain integrity)
+async function appendActivityLogEntry({ user, action, details = {}, modelName = "", partName = "", widgetType = "", visibility = 'admin' }) {
+  try {
+    const ip = '0.0.0.0';
+    const userAgent = 'system';
+    // Get last log hash to chain
+    const lastLog = await ActivityLog.findOne({}).sort({ createdAt: -1 }).select('hash').lean();
+    const previousHash = lastLog?.hash || null;
+
+    const payload = {
+      userId: user?._id?.toString() || null,
+      userEmail: user?.email || (user?._id ? String(user._id) : 'system'),
+      action,
+      modelName,
+      partName,
+      widgetType,
+      details,
+      ipAddress: ip,
+      userAgent,
+      timestamp: new Date().toISOString(),
+      previousHash
+    };
+
+    const payloadString = JSON.stringify(payload);
+    const hash = crypto.createHash('sha256').update(payloadString).digest('hex');
+
+    const log = await ActivityLog.create({
+      userId: user?._id || null,
+      userEmail: user?.email || (user?._id ? String(user._id) : 'system'),
+      userName: user?.name || (user?.email ? user.email.split('@')[0] : 'system'),
+      action,
+      details,
+      ipAddress: ip,
+      userAgent,
+      modelName,
+      partName,
+      widgetType,
+      visibility,
+      timestamp: new Date(),
+      previousHash,
+      hash
+    });
+
+    return log;
+  } catch (err) {
+    console.error('appendActivityLogEntry error:', err);
+    throw err;
+  }
+}
+
+// Export verification proof for a range (simple proof: returns ordered logs with hashes)
+app.get('/api/activity/proof', authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ message: 'Forbidden' });
+    const { from = 0, limit = 100 } = req.query;
+    const logs = await ActivityLog.find({}).sort({ createdAt: 1 }).skip(parseInt(from)).limit(parseInt(limit)).lean();
+    // Return logs with hash and previousHash for external verification
+    res.json({ count: logs.length, logs });
+  } catch (err) {
+    console.error('Activity proof export error:', err);
+    res.status(500).json({ message: 'Error exporting activity proof', error: err.message });
   }
 });
 
@@ -1752,5 +1856,174 @@ app.post('/api/upload-config', authMiddleware, requireAdmin, uploadConfig.single
       if (fs.existsSync(fileToDelete)) fs.unlinkSync(fileToDelete);
     }
     res.status(500).json({ message: 'Error uploading config', error: error.message });
+  }
+});
+
+// Admin-only: clear all activity logs (destructive) - use with caution
+app.delete('/api/activity/clear', authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ message: 'Forbidden' });
+    const result = await ActivityLog.deleteMany({});
+    console.log(`Admin ${req.user.email} cleared activity logs, deletedCount=${result.deletedCount}`);
+    // Record deletion action in activity log chain
+    try {
+      await appendActivityLogEntry({
+        user: req.user,
+        action: 'ACTIVITY_CLEAR_GLOBAL',
+        details: { deletedCount: result.deletedCount },
+        visibility: 'admin'
+      });
+    } catch (err) {
+      console.error('Failed to record deletion audit entry:', err);
+    }
+    return res.json({ message: 'Activity logs cleared', deletedCount: result.deletedCount });
+  } catch (err) {
+    console.error('Error clearing activity logs:', err);
+    return res.status(500).json({ message: 'Error clearing activity logs', error: err.message });
+  }
+});
+
+// Admin-only: clear activity logs for a specific userId
+app.delete('/api/activity/clear/:userId', authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ message: 'Forbidden' });
+    const { userId } = req.params;
+    if (!userId) return res.status(400).json({ message: 'Missing userId' });
+    const result = await ActivityLog.deleteMany({ userId });
+    console.log(`Admin ${req.user.email} cleared activity logs for user=${userId}, deletedCount=${result.deletedCount}`);
+    // Record deletion action in activity log chain (per-user)
+    try {
+      await appendActivityLogEntry({
+        user: req.user,
+        action: 'ACTIVITY_CLEAR_USER',
+        details: { targetUserId: userId, deletedCount: result.deletedCount },
+        visibility: 'admin'
+      });
+    } catch (err) {
+      console.error('Failed to record per-user deletion audit entry:', err);
+    }
+    return res.json({ message: 'Activity logs cleared for user', deletedCount: result.deletedCount });
+  } catch (err) {
+    console.error('Error clearing activity logs for user:', err);
+    return res.status(500).json({ message: 'Error clearing activity logs', error: err.message });
+  }
+});
+
+// Export activity logs as NDJSON or CSV (streaming)
+app.get('/api/activity/export', authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ message: 'Forbidden' });
+
+    const format = (req.query.format || 'ndjson').toLowerCase(); // 'ndjson' or 'csv'
+    const compress = req.query.compress === 'true';
+    const { startDate, endDate, userId, action } = req.query;
+
+    const filter = {};
+    if (startDate || endDate) {
+      filter.timestamp = {};
+      if (startDate) filter.timestamp.$gte = new Date(startDate);
+      if (endDate) filter.timestamp.$lte = new Date(endDate);
+    }
+    if (userId) filter.userId = userId;
+    if (action) filter.action = new RegExp(action, 'i');
+
+    // Set headers
+    const filenameBase = `activity-${new Date().toISOString().slice(0,10)}`;
+    if (format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${filenameBase}.csv${compress?'.gz':''}"`);
+    } else {
+      res.setHeader('Content-Type', 'application/x-ndjson');
+      res.setHeader('Content-Disposition', `attachment; filename="${filenameBase}.ndjson${compress?'.gz':''}"`);
+    }
+
+    // Use gzip if requested
+    let stream = ActivityLog.find(filter).sort({ timestamp: 1 }).cursor();
+    const { pipeline } = require('stream');
+    const zlib = require('zlib');
+
+    // Write stream helper
+    const out = res;
+
+    // Count rows for audit
+    let rowCount = 0;
+
+    if (compress) {
+      res.setHeader('Content-Encoding', 'gzip');
+    }
+
+    // Streaming handler
+    if (format === 'csv') {
+      // CSV header
+      const header = 'id,timestamp,actor_id,actor_email,actor_name,action,modelName,partName,ipAddress,hash,previousHash,details\n';
+      if (compress) out.write(zlib.gzipSync(header)); else out.write(header);
+
+      for await (const doc of stream) {
+        const row = [
+          doc._id,
+          doc.timestamp?.toISOString() || '',
+          doc.userId || '',
+          (doc.userEmail || '').replace(/\"/g, '"'),
+          (doc.userName || '').replace(/\"/g, '"'),
+          (doc.action || ''),
+          (doc.modelName || ''),
+          (doc.partName || ''),
+          (doc.ipAddress || ''),
+          (doc.hash || ''),
+          (doc.previousHash || ''),
+          JSON.stringify(doc.details || {})
+        ].map(v => {
+          if (v === null || v === undefined) return '';
+          const s = String(v).replace(/"/g, '""');
+          // wrap in quotes if contains comma or newline
+          return /[",\n]/.test(s) ? '"' + s + '"' : s;
+        }).join(',') + '\n';
+
+        if (compress) out.write(zlib.gzipSync(row)); else out.write(row);
+        rowCount++;
+        // allow client to drain
+        await new Promise(resolve => setImmediate(resolve));
+      }
+    } else {
+      // NDJSON
+      for await (const doc of stream) {
+        const obj = {
+          _id: doc._id,
+          timestamp: doc.timestamp,
+          actor_id: doc.userId,
+          actor_email: doc.userEmail,
+          actor_name: doc.userName,
+          action: doc.action,
+          modelName: doc.modelName,
+          partName: doc.partName,
+          ipAddress: doc.ipAddress,
+          hash: doc.hash,
+          previousHash: doc.previousHash,
+          details: doc.details || {}
+        };
+        const line = JSON.stringify(obj) + '\n';
+        if (compress) out.write(zlib.gzipSync(line)); else out.write(line);
+        rowCount++;
+        await new Promise(resolve => setImmediate(resolve));
+      }
+    }
+
+    // After streaming, append an ActivityLog for the export request
+    try {
+      await appendActivityLogEntry({
+        user: req.user,
+        action: 'ACTIVITY_EXPORT',
+        details: { format, filters: { startDate, endDate, userId, action }, rowCount },
+        visibility: 'admin'
+      });
+    } catch (err) {
+      console.error('Failed to record export audit entry:', err);
+    }
+
+    // End response
+    if (!res.writableEnded) res.end();
+  } catch (err) {
+    console.error('Activity export error:', err);
+    if (!res.headersSent) res.status(500).json({ message: 'Error exporting activity logs', error: err.message });
   }
 });

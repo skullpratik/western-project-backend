@@ -52,6 +52,18 @@ const ActivityLogSchema = new mongoose.Schema({
     enum: ["user", "admin", "public"],
     default: "user"
   }
+  ,
+  // Chaining fields for tamper-proof audit
+  previousHash: {
+    type: String,
+    default: null,
+    index: true
+  },
+  hash: {
+    type: String,
+    default: null,
+    index: true
+  }
 }, {
   timestamps: true
 });
@@ -60,5 +72,7 @@ const ActivityLogSchema = new mongoose.Schema({
 ActivityLogSchema.index({ userId: 1, timestamp: -1 });
 ActivityLogSchema.index({ userEmail: 1, timestamp: -1 });
 ActivityLogSchema.index({ visibility: 1 });
+ActivityLogSchema.index({ hash: 1 });
+ActivityLogSchema.index({ previousHash: 1 });
 
 module.exports = mongoose.model("ActivityLog", ActivityLogSchema);
