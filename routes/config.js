@@ -4,10 +4,11 @@ const path = require('path');
 const router = express.Router();
 
 // PUT /api/configs/:filename - Overwrite an existing config file
-router.put('/:filename', async (req, res) => {
+router.put('/:filename', async (req, res, next) => {
   try {
     const { filename } = req.params;
-    if (!filename.endsWith('.json')) return res.status(400).json({ message: 'Invalid config filename' });
+  // If this isn't a file-based request (e.g. it's a Mongo _id), let higher-level routes handle it
+  if (!filename.endsWith('.json')) return next();
     const configsDir = path.join(__dirname, '../../Frontend/public/configs');
     const filePath = path.join(configsDir, filename);
     if (!fs.existsSync(filePath)) return res.status(404).json({ message: 'Config file not found' });
@@ -19,10 +20,12 @@ router.put('/:filename', async (req, res) => {
 });
 
 // DELETE /api/configs/:filename - Remove a config file
-router.delete('/:filename', async (req, res) => {
+router.delete('/:filename', async (req, res, next) => {
   try {
     const { filename } = req.params;
-    if (!filename.endsWith('.json')) return res.status(400).json({ message: 'Invalid config filename' });
+  // If the param isn't a .json filename, this router shouldn't handle it.
+  // Call next() so the DB-backed routes in server.js can match (e.g., DELETE by Mongo _id).
+  if (!filename.endsWith('.json')) return next();
     const configsDir = path.join(__dirname, '../../Frontend/public/configs');
     const filePath = path.join(configsDir, filename);
     if (!fs.existsSync(filePath)) return res.status(404).json({ message: 'Config file not found' });

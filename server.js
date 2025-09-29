@@ -372,11 +372,28 @@ async function copyTextureForConfig(sourcePath, configId, textureKey) {
 async function cleanupConfigTextures(configId) {
   try {
     const configTexturesPath = path.join(__dirname, '../Frontend/public/config-textures', configId);
-    if (fs.existsSync(configTexturesPath)) {
+    if (!fs.existsSync(configTexturesPath)) {
+      return;
+    }
+
+    // Prefer newer fs.rm if available, with force to avoid permission issues
+    if (fs.promises.rm) {
+      try {
+        await fs.promises.rm(configTexturesPath, { recursive: true, force: true });
+        return;
+      } catch (rmErr) {
+        console.warn('cleanupConfigTextures: fs.promises.rm failed, falling back to rmdir:', rmErr && (rmErr.stack || rmErr));
+      }
+    }
+
+    // Fallback for older Node versions
+    try {
       await fs.promises.rmdir(configTexturesPath, { recursive: true });
+    } catch (rmdirErr) {
+      console.error('cleanupConfigTextures: rmdir failed:', rmdirErr && (rmdirErr.stack || rmdirErr));
     }
   } catch (error) {
-    console.error('Error cleaning up texture files:', error);
+    console.error('Error cleaning up texture files (unexpected):', error && (error.stack || error));
   }
 }
 
@@ -1762,8 +1779,16 @@ app.get("/api/configs/:id", authMiddleware, async (req, res) => {
 // Delete configuration
 app.delete("/api/configs/:id", authMiddleware, async (req, res) => {
   try {
+    const configId = req.params.id;
+    // Validate ObjectId early to avoid Mongoose CastErrors causing 500 responses
+    if (!mongoose.Types.ObjectId.isValid(configId)) {
+      console.warn(`Attempt to delete configuration with invalid id: ${configId}`);
+      return res.status(400).json({ message: 'Invalid configuration id' });
+    }
+
+    // Attempt to find-and-delete the saved configuration (owner must match)
     const config = await SavedConfiguration.findOneAndDelete({
-      _id: req.params.id,
+      _id: configId,
       userId: req.user._id
     });
 
@@ -1772,12 +1797,16 @@ app.delete("/api/configs/:id", authMiddleware, async (req, res) => {
     }
 
     // Clean up texture files associated with this configuration
-    await cleanupConfigTextures(config._id.toString());
+    try {
+      await cleanupConfigTextures(config._id.toString());
+    } catch (cleanupErr) {
+      console.error('cleanupConfigTextures error for', configId, cleanupErr && (cleanupErr.stack || cleanupErr));
+    }
 
     res.json({ message: "Configuration deleted successfully" });
   } catch (error) {
-    console.error("Delete configuration error:", error);
-    res.status(500).json({ message: "Error deleting configuration", error: error.message });
+    console.error("Delete configuration error:", error && (error.stack || error));
+    res.status(500).json({ message: "Error deleting configuration", error: error.message || String(error) });
   }
 });
 
