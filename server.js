@@ -10,14 +10,6 @@ const fs = require("fs");
 const ActivityLog = require("./models/ActivityLog");
 require("dotenv").config();
 
-// Configurable blacklist for noisy activity actions (comma-separated env var)
-const ACTIVITY_BLACKLIST = new Set(
-  (process.env.ACTIVITY_BLACKLIST || 'MODEL_LOADED')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
-);
-
 const app = express();
 
 // Helper to safely extract client IP (supports proxies if X-Forwarded-For present)
@@ -859,12 +851,6 @@ app.post("/api/activity/log", authMiddleware, async (req, res) => {
     const ip = getClientIp(req);
     const userAgent = req.get('User-Agent') || '';
 
-    // Drop blacklisted actions early to avoid storing noisy events
-    if (action && ACTIVITY_BLACKLIST.has(action)) {
-      console.log(`Dropped blacklisted activity action: ${action}`);
-      return res.status(202).json({ message: 'Action ignored' });
-    }
-
     // Get last log hash to chain
     const lastLog = await ActivityLog.findOne({}).sort({ createdAt: -1 }).select('hash').lean();
     const previousHash = lastLog?.hash || null;
@@ -1635,6 +1621,62 @@ app.get("/api/admin/models/files", authMiddleware, requireAdmin, async (req, res
   } catch (error) {
     console.error("Get model files error:", error);
     res.status(500).json({ message: "Error fetching model files", error: error.message });
+  }
+});
+
+// Admin endpoint to get configurations for a specific user
+app.get("/api/admin/user-configs/:userId", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { modelName } = req.query;
+    
+    const filter = { userId: userId };
+    if (modelName) {
+      filter.modelName = modelName;
+    }
+
+    const configs = await SavedConfiguration.find(filter)
+      .sort({ updatedAt: -1 })
+      .populate('userId', 'name email');
+    
+    res.json(configs);
+  } catch (error) {
+    console.error("Get user configurations error:", error);
+    res.status(500).json({ message: "Error fetching user configurations", error: error.message });
+  }
+});
+
+// Admin endpoint to delete any user's configuration
+app.delete("/api/admin/user-configs/:configId", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const configId = req.params.configId;
+    
+    // Validate ObjectId early to avoid Mongoose CastErrors causing 500 responses
+    if (!mongoose.Types.ObjectId.isValid(configId)) {
+      console.warn(`Attempt to delete configuration with invalid id: ${configId}`);
+      return res.status(400).json({ message: 'Invalid configuration id' });
+    }
+
+    // Find the configuration first to get its details for cleanup
+    const config = await SavedConfiguration.findById(configId);
+    if (!config) {
+      return res.status(404).json({ message: "Configuration not found" });
+    }
+
+    // Delete the configuration
+    await SavedConfiguration.findByIdAndDelete(configId);
+
+    // Clean up texture files associated with this configuration
+    try {
+      await cleanupConfigTextures(configId);
+    } catch (cleanupErr) {
+      console.error('cleanupConfigTextures error for', configId, cleanupErr && (cleanupErr.stack || cleanupErr));
+    }
+
+    res.json({ message: "Configuration deleted successfully" });
+  } catch (error) {
+    console.error("Delete user configuration error:", error && (error.stack || error));
+    res.status(500).json({ message: "Error deleting configuration", error: error.message || String(error) });
   }
 });
 
