@@ -7,6 +7,10 @@ const jwt = require("jsonwebtoken");
 
 router.post("/register", async (req, res) => {
   try {
+    // Prevent public self-registration unless explicitly allowed via env var
+    if (process.env.ALLOW_SELF_REGISTRATION !== 'true') {
+      return res.status(403).json({ message: "Self-registration is disabled. Please contact your administrator." });
+    }
     const { name, email, password } = req.body;
     
     // Check if user exists

@@ -392,6 +392,24 @@ async function cleanupConfigTextures(configId) {
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key-here";
 
+// Simple in-memory SSE clients map: userId -> Set of response objects
+const sseClients = new Map();
+
+// Helper to send SSE event to a specific user
+function sendSseEventToUser(userId, eventName, payload = {}) {
+  const set = sseClients.get(userId);
+  if (!set) return;
+  const data = JSON.stringify(payload);
+  for (const res of set) {
+    try {
+      res.write(`event: ${eventName}\n`);
+      res.write(`data: ${data}\n\n`);
+    } catch (err) {
+      console.warn('SSE write failed for user', userId, err && err.message);
+    }
+  }
+}
+
 // Ensure default demo accounts exist and match expected credentials/permissions
 const ensureDefaultAccounts = async () => {
   try {
@@ -502,6 +520,11 @@ const authMiddleware = async (req, res, next) => {
 // Routes
 app.post("/api/auth/register", async (req, res) => {
   try {
+  // Prevent public self-registration unless explicitly enabled
+  if (process.env.ALLOW_SELF_REGISTRATION !== 'true') {
+    return res.status(403).json({ message: "Self-registration is disabled. Please contact your administrator." });
+  }
+
   let { name, email, password } = req.body;
   // Normalize inputs
   email = (email || "").toLowerCase().trim();
@@ -715,6 +738,13 @@ app.put("/api/admin-dashboard/users/:id/permissions", authMiddleware, async (req
       return res.status(404).json({ message: "User not found" });
     }
     
+    // Notify any connected SSE clients for that user about permission change
+    try {
+      sendSseEventToUser(user._id.toString(), 'permissionsUpdated', { permissions: user.permissions });
+    } catch (e) {
+      console.warn('Failed to send SSE permissionsUpdated event', e && e.message);
+    }
+
     res.json({ message: "Permissions updated successfully", user });
   } catch (error) {
     console.error("Update permissions error:", error);
@@ -2096,5 +2126,76 @@ app.get('/api/activity/export', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('Activity export error:', err);
     if (!res.headersSent) res.status(500).json({ message: 'Error exporting activity logs', error: err.message });
+  }
+});
+
+// Create user (admin only)
+app.post('/api/admin-dashboard/users', authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ message: 'Access denied' });
+
+    const { name, email, password, role = 'user', permissions = {} } = req.body;
+    if (!name || !email || !password) return res.status(400).json({ message: 'Name, email and password are required' });
+
+    const existing = await User.findOne({ email: email.toLowerCase().trim() });
+    if (existing) return res.status(400).json({ message: 'User already exists' });
+
+    const bcrypt = require('bcryptjs');
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const newUser = new User({
+      name,
+      email: email.toLowerCase().trim(),
+      password: hashedPassword,
+      role,
+      permissions,
+      isActive: true
+    });
+
+    await newUser.save();
+
+    const userObj = newUser.toObject();
+    delete userObj.password;
+
+    res.status(201).json({ message: 'User created', user: userObj });
+  } catch (error) {
+    console.error('Create user error:', error);
+    res.status(500).json({ message: 'Error creating user', error: error.message });
+  }
+});
+
+// SSE stream endpoint for real-time events (permissions updates etc.)
+app.get('/api/stream', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1] || req.query.token;
+    if (!token) return res.status(401).end('No token');
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); } catch (e) { return res.status(401).end('Invalid token'); }
+    const userId = decoded.id;
+
+    // Set headers for SSE
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive'
+    });
+
+    // Send a ping so client knows connection is active
+    res.write('event: connected\n');
+    res.write(`data: ${JSON.stringify({ message: 'connected' })}\n\n`);
+
+    if (!sseClients.has(userId)) sseClients.set(userId, new Set());
+    sseClients.get(userId).add(res);
+
+    req.on('close', () => {
+      const set = sseClients.get(userId);
+      if (set) {
+        set.delete(res);
+        if (!set.size) sseClients.delete(userId);
+      }
+    });
+  } catch (error) {
+    console.error('SSE stream error:', error);
+    res.status(500).end();
   }
 });
