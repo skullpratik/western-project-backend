@@ -804,10 +804,49 @@ app.delete("/api/admin-dashboard/users/:id", authMiddleware, async (req, res) =>
     if (user._id.toString() === req.user._id.toString()) {
       return res.status(400).json({ message: "Cannot delete your own account" });
     }
-    
-    await User.findByIdAndDelete(req.params.id);
-    
-    res.json({ message: "User deleted successfully" });
+    // Check optional transferTo query param
+    const transferTo = req.query.transferTo;
+
+    if (transferTo) {
+      // Validate transferTo id
+      if (!mongoose.Types.ObjectId.isValid(transferTo)) {
+        return res.status(400).json({ message: 'Invalid transferTo user id' });
+      }
+
+      const targetUser = await User.findById(transferTo);
+      if (!targetUser) {
+        return res.status(404).json({ message: 'Target user for transfer not found' });
+      }
+
+      // Reassign saved configurations to the target user
+      const result = await SavedConfiguration.updateMany({ userId: user._id }, { $set: { userId: targetUser._id } });
+
+      // Finally delete the user
+      await User.findByIdAndDelete(req.params.id);
+
+      return res.json({ message: 'User deleted and configurations transferred', transferredCount: result.modifiedCount || result.nModified || 0 });
+    } else {
+      // No transfer requested - delete configs owned by this user and clean up textures
+      try {
+        const configs = await SavedConfiguration.find({ userId: user._id }).select('_id');
+        for (const cfg of configs) {
+          try {
+            await cleanupConfigTextures(cfg._id.toString());
+          } catch (cleanupErr) {
+            console.warn('Failed to cleanup textures for config', cfg._id, cleanupErr && (cleanupErr.stack || cleanupErr));
+          }
+        }
+
+        // Remove configurations from DB
+        await SavedConfiguration.deleteMany({ userId: user._id });
+      } catch (cfgErr) {
+        console.error('Error while deleting user configurations during user deletion:', cfgErr && (cfgErr.stack || cfgErr));
+        // proceed with user deletion even if config cleanup failed, but report warning
+      }
+
+      await User.findByIdAndDelete(req.params.id);
+      return res.json({ message: 'User and their configurations deleted' });
+    }
   } catch (error) {
     console.error("Delete user error:", error);
     res.status(500).json({ message: "Error deleting user", error: error.message });
